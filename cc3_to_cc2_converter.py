@@ -437,18 +437,12 @@ class AssetCopier:
             tex_result = pre_reg.find_texture(src.stem)
             if tex_result:
                 pre_img, pre_tex_uuid, pre_sf_uuid = tex_result
-                # Copy pre-converted texture + its CC2 meta as-is
-                if not dst.exists():
-                    shutil.copy2(pre_img, dst)
-                pre_meta = pre_img.parent / (pre_img.name + ".meta")
-                meta_dst = dst.parent / (dst.name + ".meta")
-                if pre_meta.exists() and not meta_dst.exists():
-                    shutil.copy2(pre_meta, meta_dst)
-                # Rewire: old @f9941 UUID → new spriteFrame UUID from CC2 meta
+                # Texture already exists in CC2 project — do NOT copy to output
+                # Just rewire: old CC3 @f9941 UUID → CC2 spriteFrame UUID
                 if "@" in uuid and pre_sf_uuid:
-                    self.uuid_map[uuid] = pre_sf_uuid  # store new SF uuid for rewiring
+                    self.uuid_map[uuid] = pre_sf_uuid
                 if VERBOSE:
-                    print(f"    [pre-conv tex] {src.stem}: sf {uuid[-6:]} → {pre_sf_uuid[:8]}…")
+                    print(f"    [pre-conv tex] {src.stem}: rewire sf → {pre_sf_uuid[:8]}… (skipping copy)")
                 return
 
         # ── Default: copy asset file ──────────────────────────────────────────
