@@ -1414,6 +1414,7 @@ COMPONENT_MAP = [
     ("Button",             conv_button),
     ("Toggle",             conv_toggle),
     ("ToggleGroup",        conv_toggle_group),
+    ("ToggleContainer",    "SILENT_SKIP"),
     ("Slider",             conv_slider),
     ("ScrollView",         conv_scroll_view),
     ("Scrollbar",          conv_scrollbar),
