@@ -835,9 +835,8 @@ def conv_custom_script(c, nr):
     CC2 can load the converted .js file.
     """
     t = c.get("__type__","")
-    # Derive a short class name (last segment after last dot or slash)
-    short = re.split(r'[./]', t)[-1]
-    result = {"__type__": short, "_name":"","_objFlags":0, "node": nr,
+    # Keep __type__ as-is — CC2 uses the full UUID path string as type identifier
+    result = {"__type__": t, "_name":"","_objFlags":0, "node": nr,
               "_enabled": _b(c,"_enabled",default=True)}
     # copy all other serialised fields verbatim
     skip = {"__type__","_name","_objFlags","node","_enabled","_id"}
@@ -912,10 +911,11 @@ def find_converter(type_str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PrefabConverter:
-    def __init__(self, cc3):
+    def __init__(self, cc3, uuid_script_map=None):
         self.cc3 = cc3
         self.cc2 = []
         self._map = {}
+        self._uuid_script_map = uuid_script_map or {}
 
     def _allocate(self):
         for i,o in enumerate(self.cc3):
@@ -997,7 +997,6 @@ class PrefabConverter:
             else:
                 cc2c=fn(comp,ref(idx))
                 if cc2c is None: continue
-            print("find",t,"->",fn,"->",cc2c)
 
             ni=len(self.cc2); self.cc2.append(cc2c); comp_refs.append(ref(ni))
             if VERBOSE: print(f"      [{ni}] {cc2c.get('__type__','?')}")
@@ -1020,10 +1019,10 @@ class Pipeline:
     def __init__(self, src_root: Path, out_root: Path, assets_root: Path):
         self.src     = src_root
         self.out     = out_root
-        # For single-file output: place assets in <prefab_stem>/ next to the output file
-        # For folder output: place assets inside the output folder
+        # For single-file output: place assets/ next to the output file
+        # For folder output: place assets/ inside the output folder
         if src_root.is_file() and out_root.suffix:
-            self._out_folder = out_root.parent / out_root.stem
+            self._out_folder = out_root.parent
         else:
             self._out_folder = out_root
         self.reg     = AssetRegistry(assets_root) if DO_ASSETS else None
@@ -1059,7 +1058,6 @@ class Pipeline:
                 self._uuid_script_map[u] = ts_path
                 compressed = _compress_uuid(u)
                 self._uuid_script_map[compressed] = ts_path
-                print("register",u,"->",compressed,"->",ts_path)
 
             def _extract_uuids(obj, ts_path: Path):
                 if isinstance(obj, dict):
@@ -1128,12 +1126,12 @@ class Pipeline:
                 if not isinstance(obj,dict): continue
                 t=obj.get("__type__","")
                 if t and not any(t.startswith(p) for p in _BUILTIN_PREFIXES):
-                    short=re.split(r'[./]',t)[-1]
-                    script_types.add(short)
+
+                    script_types.add(t)
 
         # 3. convert prefab
         try:
-            out_data = PrefabConverter(data).convert()
+            out_data = PrefabConverter(data, self._uuid_script_map).convert()
         except Exception as e:
             print(f"    ✗ conversion error: {e}", file=sys.stderr); self.n_errors+=1
             if STRICT: raise
@@ -1150,38 +1148,68 @@ class Pipeline:
                 self._convert_script(short, dst.parent)
 
     # ── script conversion ─────────────────────────────────────────────────────
-    _UUID_RE = re.compile(r'^[0-9a-fA-F+/]{20,}$')  # CC3 UUIDs are base64-ish, 20+ chars
+    _UUID_RE = re.compile(r'^[0-9a-zA-Z+/]{23}$')  # CC3 compressed UUIDs: exactly 23 base64 chars
 
     def _convert_script(self, class_name: str, prefab_out_dir: Path):
         ts_path = None
         output_name = class_name
-
+        print("convert script",class_name)
+        print("convert _UUID_RE",self._UUID_RE)
+        print("convert _uuid_script_map",self._uuid_script_map)
         if self._UUID_RE.match(class_name):
             ts_path = self._uuid_script_map.get(class_name)
+            print("convert ts_path",ts_path)
             if ts_path:
                 output_name = ts_path.stem
             else:
-                # UUID not found = likely a built-in CC3 engine component, not a user script
                 if VERBOSE:
                     print(f"    [skip] UUID '{class_name}' not in assets (built-in engine component?)")
                 return
         else:
+            print("convert _script_map--",self._script_map)
             ts_path = self._script_map.get(class_name)
+            print("convert ts_path--",ts_path)
             if ts_path is None:
-                # Readable name not found = warn, user may need to add it manually
                 if VERBOSE:
                     print(f"    ⚠  Script '{class_name}.ts' not found in assets root")
                 return
 
         dst_scripts = self._out_folder / "assets" / "Scripts"
         dst_scripts.mkdir(parents=True,exist_ok=True)
-        dst_js = dst_scripts / (output_name + ".js")
-        if dst_js.exists():
-            return   # already converted (shared by multiple prefabs)
-        convert_script_file(ts_path, dst_js)
-        print(f"    ✓ script  {ts_path.name}  →  Scripts/{output_name}.js")
+        dst_scripts.mkdir(parents=True,exist_ok=True)
+        dst_js   = dst_scripts / (output_name + ".js")
+        dst_meta = dst_scripts / (output_name + ".js.meta")
+        # Find source meta: Try Script.ts.meta then Script.meta
+        src_meta_path = ts_path.parent / (ts_path.name + ".meta")
+        if not src_meta_path.exists():
+            src_meta_path = ts_path.with_suffix(".meta")
+        if not src_meta_path.exists():
+            src_meta_path = None
+        # Convert script file
+        if not dst_js.exists():
+            convert_script_file(ts_path, dst_js)
+        # Write CC2-format meta (NOT a copy of CC3 meta — format is different)
+        if not dst_meta.exists():
+            uuid = ""
+            if src_meta_path:
+                try:
+                    uuid = json.loads(src_meta_path.read_text("utf-8")).get("uuid", "")
+                except Exception:
+                    pass
+            cc2_meta = {
+                "ver": "1.1.0",
+                "uuid": uuid,
+                "importer": "typescript",
+                "isPlugin": False,
+                "loadPluginInWeb": True,
+                "loadPluginInNative": True,
+                "loadPluginInEditor": False,
+                "subMetas": {}
+            }
+            dst_meta.write_text(json.dumps(cc2_meta, indent=2, ensure_ascii=False), "utf-8")
+            if VERBOSE: print(f"    [meta]  → Scripts/{output_name}.js.meta  (uuid={uuid[:8]}…)")
+        print(f"    ✓ script  {ts_path.name}  →  Scripts/{output_name}.js + .meta")
         self.n_scripts+=1
-
     # ── summary ───────────────────────────────────────────────────────────────
     def _print_summary(self):
         n_assets = len(self.copier.uuid_map) if self.copier else 0
