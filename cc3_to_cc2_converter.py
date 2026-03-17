@@ -42,16 +42,24 @@ DO_ASSETS  = True
 DO_SCRIPTS = True
 
 # ── Pre-converted script folders ─────────────────────────────────────────────
-# Hard-code folders that already contain CC2-converted .js scripts.
+# Hard-code folders that already contain CC2 .ts scripts.
 # When a prefab references a script by name, these folders are checked FIRST.
-# If found: the existing .js + .meta is used (no re-conversion),
-#           and the prefab's UUID is rewritten to match the new script's UUID.
+# If found: the existing .ts + .meta is copied, UUID rewritten in prefab.
 PRE_CONVERTED_DIRS: list[str] = [
     "/Users/nhitieu/Documents/Projects/WPTGNewClient1/wptg-client/assets"
     # "/Users/nhitieu/NewProject_2/assets/bundles"
     # Add your pre-converted script folder paths here, e.g.:
     # "/Users/nhitieu/NewProject_2/assets/scripts",
     # "/Users/nhitieu/SharedScripts/cc2",
+]
+
+# ── Script name conventions ───────────────────────────────────────────────────
+# Map CC3 script stem → CC2 script stem when the file was renamed.
+# Lookup in PRE_CONVERTED_DIRS will use the CC2 name.
+# Format: ("CC3_stem", "CC2_stem")
+NAME_CONVENTIONS: list[tuple[str, str]] = [
+    ("BottomMenuHandler",         "BottomMenuHandlerPortrait"),
+    # ("SomeOldName",               "SomeNewName"),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,8 +104,17 @@ class PreConvertedRegistry:
             print(f"[pre-converted] {p}: {count} .ts scripts indexed")
 
     def find(self, ts_stem: str):
-        """Look up by .ts filename stem. Returns (ts_path, new_uuid) or None."""
-        return self._map.get(ts_stem.lower())
+        """Look up by .ts filename stem (CC3 name). Returns (ts_path, new_uuid) or None.
+        Applies NAME_CONVENTIONS mapping before lookup.
+        """
+        # Build convention map (case-insensitive): cc3_stem_lower → cc2_stem_lower
+        _conv = {cc3.lower(): cc2.lower() for cc3, cc2 in NAME_CONVENTIONS}
+        lookup_stem = _conv.get(ts_stem.lower(), ts_stem.lower())
+        result = self._map.get(lookup_stem)
+        if result and lookup_stem != ts_stem.lower():
+            if VERBOSE:
+                print(f"    [convention] {ts_stem} → {lookup_stem}")
+        return result
 
 
 # Singleton — built once at pipeline startup
@@ -1326,10 +1343,11 @@ class Pipeline:
                         new_uuid_compressed = _compress(new_uuid_hex)
                         if new_uuid_compressed and new_uuid_compressed != t:
                             uuid_rewrites[t] = new_uuid_compressed
-                            print(f"    [pre-conv] {ts_path.stem}:")
-                            print(f"      old __type__ : {t}")
-                            print(f"      new_uuid_hex : {new_uuid_hex}")
-                            print(f"      new compressed: {new_uuid_compressed}")
+                            # Check if name convention was applied
+                            _conv_map = {cc3.lower(): cc2 for cc3, cc2 in NAME_CONVENTIONS}
+                            cc2_name = _conv_map.get(ts_path.stem.lower(), ts_path.stem)
+                            conv_note = f" → {cc2_name}" if cc2_name != ts_path.stem else ""
+                            print(f"    [pre-conv] {ts_path.stem}{conv_note}: {t[:16]}… → {new_uuid_compressed[:16]}…")
             # Apply rewrites to prefab data: replace ALL occurrences of old UUID
             # (in __type__, typeUuid, and any string value that matches)
             if uuid_rewrites:
