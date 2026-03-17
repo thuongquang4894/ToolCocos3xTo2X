@@ -87,7 +87,8 @@ class PreConvertedRegistry:
         self._map: dict[str, tuple] = {}      # stem_lower → (ts_path, uuid)
         self._tex_map: dict[str, tuple] = {}   # stem_lower → (img_path, tex_uuid, sf_uuid)
         self._font_map: dict[str, tuple] = {}    # stem_lower → (font_path, uuid)
-        self._effect_map: dict[str, tuple] = {}  # stem_lower → (effect_path, uuid)
+        self._effect_map: dict[str, tuple] = {}   # stem_lower → (effect_path, uuid)
+        self._prefab_map: dict[str, tuple] = {}   # stem_lower → (prefab_path, uuid)
         self._scan()
 
     # Image extensions to scan for pre-converted textures
@@ -161,7 +162,17 @@ class PreConvertedRegistry:
                             except Exception: pass
                         self._effect_map[stem] = (fpath, effect_uuid)
 
-            print(f"[pre-converted] {p}: {ts_count} scripts, {tex_count} textures, {len(self._font_map)} fonts, {len(self._effect_map)} effects indexed")
+                    elif ext == ".prefab":
+                        stem = fpath.stem.lower()
+                        meta_path = Path(dirpath) / (fname + ".meta")
+                        prefab_uuid = ""
+                        if meta_path.exists():
+                            try:
+                                prefab_uuid = json.loads(meta_path.read_text("utf-8")).get("uuid","")
+                            except Exception: pass
+                        self._prefab_map[stem] = (fpath, prefab_uuid)
+
+            print(f"[pre-converted] {p}: {ts_count} scripts, {tex_count} textures, {len(self._font_map)} fonts, {len(self._effect_map)} effects, {len(self._prefab_map)} prefabs indexed")
 
     def find(self, ts_stem: str):
         """Look up by .ts filename stem (CC3 name). Returns (ts_path, new_uuid, matched_stem) or None.
@@ -239,6 +250,20 @@ class PreConvertedRegistry:
             if r: return r
         for suffix in EXTENSION_SUFFIXES:
             r = self._effect_map.get((stem + suffix).lower())
+            if r: return r
+        return None
+
+    def find_prefab(self, stem: str):
+        """Look up prefab by stem. Applies NAME_CONVENTIONS + EXTENSION_SUFFIXES."""
+        stem_lower = stem.lower()
+        r = self._prefab_map.get(stem_lower)
+        if r: return r
+        _conv = {cc3.lower(): cc2 for cc3, cc2 in NAME_CONVENTIONS}
+        if stem_lower in _conv:
+            r = self._prefab_map.get(_conv[stem_lower].lower())
+            if r: return r
+        for suffix in EXTENSION_SUFFIXES:
+            r = self._prefab_map.get((stem + suffix).lower())
             if r: return r
         return None
 
@@ -323,6 +348,7 @@ class AssetRegistry:
         ".tmx":  "TiledMaps",
         ".plist":"Particles",
         ".effect":"Effects", ".chunk":"Effects",
+        ".prefab":"Prefabs",
     }
 
     def __init__(self, assets_root: Path):
@@ -454,11 +480,12 @@ class AssetCopier:
     into  out_root/assets/<Category>/  exactly once.
     Returns a uuid → new_relative_path dict for re-wiring.
     """
-    def __init__(self, registry: AssetRegistry, out_root: Path):
-        self.reg      = registry
-        self.out_root = out_root
+    def __init__(self, registry: AssetRegistry, out_root: Path, uuid_script_map: dict = None):
+        self.reg             = registry
+        self.out_root        = out_root
         self._done:   set[str]        = set()
         self.uuid_map: dict[str, str] = {}  # uuid → new relative path string
+        self._uuid_script_map = uuid_script_map or {}  # for nested prefab script rewiring
 
     def register(self, uuid: str):
         if not uuid or uuid in self._done:
@@ -484,6 +511,85 @@ class AssetCopier:
         dst = dst_dir / src.name
         rel = str(dst.relative_to(self.out_root)).replace("\\", "/")
         self.uuid_map[uuid] = rel
+
+        # ── Prefabs: check PRE_CONVERTED_DIRS first, else convert recursively ────
+        if src.suffix.lower() == ".prefab" and PRE_CONVERTED_DIRS:
+            pre_reg = get_pre_converted()
+            prefab_result = pre_reg.find_prefab(src.stem)
+            if prefab_result:
+                pre_path, new_uuid = prefab_result
+                # Prefab already in CC2 project — just rewire UUID, skip copy
+                if new_uuid:
+                    self.uuid_map[uuid] = new_uuid
+                if VERBOSE:
+                    print(f"    [pre-conv prefab] {src.stem}: skipping copy, uuid={new_uuid[:8]}…")
+                return
+
+        if src.suffix.lower() == ".prefab":
+            # Convert prefab recursively into cloned_from_3x/Prefabs/
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                try:
+                    pdata = json.loads(src.read_text("utf-8"))
+                    if isinstance(pdata, list):
+                        # collect assets from nested prefab
+                        self.collect_from_prefab(pdata)
+                        # Apply script UUID rewrites (same as _process_prefab does)
+                        if self._uuid_script_map and PRE_CONVERTED_DIRS:
+                            _B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+                            def _compress(u):
+                                h = u.replace('-','')
+                                if len(h)!=32: return u
+                                r2=h[:5]
+                                for k in range(5,32,3):
+                                    v2=int(h[k:k+3],16)
+                                    r2+=_B64[v2>>6]+_B64[v2&63]
+                                return r2
+                            pre_reg = get_pre_converted()
+                            uuid_rewrites = {}
+                            for obj in pdata:
+                                if not isinstance(obj,dict): continue
+                                t2 = obj.get("__type__","")
+                                if t2 and not any(t2.startswith(p) for p in _BUILTIN_PREFIXES):
+                                    ts_p = self._uuid_script_map.get(t2)
+                                    if ts_p:
+                                        res = pre_reg.find(ts_p.stem)
+                                        if res:
+                                            _,new_hex,_ = res
+                                            new_c = _compress(new_hex)
+                                            if new_c and new_c != t2:
+                                                uuid_rewrites[t2] = new_c
+                            if uuid_rewrites:
+                                def _rw(o2):
+                                    if isinstance(o2,dict):
+                                        for k2 in list(o2.keys()):
+                                            v2=o2[k2]
+                                            if isinstance(v2,str) and v2 in uuid_rewrites: o2[k2]=uuid_rewrites[v2]
+                                            else: _rw(v2)
+                                    elif isinstance(o2,list):
+                                        for i2,v2 in enumerate(o2):
+                                            if isinstance(v2,str) and v2 in uuid_rewrites: o2[i2]=uuid_rewrites[v2]
+                                            else: _rw(v2)
+                                _rw(pdata)
+                        # convert prefab
+                        out_data = PrefabConverter(pdata, self._uuid_script_map).convert()
+                        dst.write_text(json.dumps(out_data, ensure_ascii=False, indent=2), "utf-8")
+                        if VERBOSE:
+                            print(f"    [prefab] converted {src.name} → cloned_from_3x/Prefabs/")
+                    else:
+                        shutil.copy2(src, dst)
+                except Exception as e:
+                    if VERBOSE:
+                        print(f"    [prefab] error converting {src.name}: {e}")
+                    shutil.copy2(src, dst)
+            # copy .meta
+            for meta_src in [src.parent/(src.name+".meta"), src.with_suffix(src.suffix+".meta")]:
+                if meta_src.exists():
+                    meta_dst = dst.parent/(dst.name+".meta")
+                    if not meta_dst.exists():
+                        shutil.copy2(meta_src, meta_dst)
+                    break
+            return
 
         # ── Fonts: check PRE_CONVERTED_DIRS first ────────────────────────────────
         font_exts = {".ttf", ".otf", ".fnt"}
@@ -1257,22 +1363,41 @@ def conv_skeleton(c,nr):
             "timeScale":_f(c,"timeScale","_timeScale",default=1.0),
             "debugBones":_b(c,"debugBones"),"debugSlots":_b(c,"debugSlots"),"_id":""}
 
-def conv_custom_script(c, nr):
+def conv_custom_script(c, nr, id_map=None):
     """
     Any component whose __type__ contains a dot-less name or a project namespace
     (i.e. not a cc.* / sp.* builtin) is treated as a custom script component.
     We preserve all serialised properties and re-type it as the same name so
     CC2 can load the converted .js file.
+    id_map: CC3 index → CC2 index, used to remap __id__ node references.
     """
     t = c.get("__type__","")
+
+    def _remap(obj):
+        """Recursively remap CC3 __id__ refs to CC2 indices using id_map."""
+        if id_map is None:
+            return obj
+        if isinstance(obj, dict):
+            if "__id__" in obj and len(obj) == 1:
+                cc3_id = obj["__id__"]
+                cc2_id = id_map.get(cc3_id)
+                if cc2_id is not None:
+                    return {"__id__": cc2_id}
+                else:
+                    return None  # node not in map (filtered out)
+            return {k: _remap(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_remap(v) for v in obj]
+        return obj
+
     # Keep __type__ as-is — CC2 uses the full UUID path string as type identifier
     result = {"__type__": t, "_name":"","_objFlags":0, "node": nr,
               "_enabled": _b(c,"_enabled",default=True)}
-    # copy all other serialised fields verbatim
-    skip = {"__type__","_name","_objFlags","node","_enabled","_id"}
+    # copy all other serialised fields, remapping __id__ refs
+    skip = {"__type__","_name","_objFlags","node","_enabled","_id","__editorExtras__","__prefab__"}
     for k,v in c.items():
         if k not in skip:
-            result[k] = v
+            result[k] = _remap(v)
     result["_id"] = ""
     return result
 
@@ -1437,7 +1562,11 @@ class PrefabConverter:
                     warnings.warn(f"Unknown component passed through: {t}")
                 cc2c=dict(comp); cc2c["__type__"]="cc3_UNKNOWN_"+t.split(".")[-1]; cc2c["node"]=ref(idx)
             else:
-                cc2c=fn(comp,ref(idx))
+                # Pass id_map to custom script converter for __id__ remapping
+                if fn is conv_custom_script:
+                    cc2c=fn(comp, ref(idx), id_map=self._map)
+                else:
+                    cc2c=fn(comp,ref(idx))
                 if cc2c is None: continue
 
             ni=len(self.cc2); self.cc2.append(cc2c); comp_refs.append(ref(ni))
@@ -1467,8 +1596,9 @@ class Pipeline:
             self._out_folder = out_root.parent
         else:
             self._out_folder = out_root
+        self._uuid_script_map: dict[str, Path] = {}  # pre-init so copier can reference it
         self.reg     = AssetRegistry(assets_root) if DO_ASSETS else None
-        self.copier  = AssetCopier(self.reg, self._out_folder) if DO_ASSETS and self.reg else None
+        self.copier  = AssetCopier(self.reg, self._out_folder, self._uuid_script_map) if DO_ASSETS and self.reg else None
 
         # stats
         self.n_prefabs  = 0
@@ -1478,7 +1608,7 @@ class Pipeline:
 
         # script source lookup: class_short_name → Path(.ts)  AND  uuid → Path(.ts)
         self._script_map: dict[str, Path] = {}   # stem → path
-        self._uuid_script_map: dict[str, Path] = {}  # uuid → path (all formats)
+
         if DO_SCRIPTS and assets_root and assets_root.exists():
             import os as _os
 
