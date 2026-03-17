@@ -46,7 +46,8 @@ DO_SCRIPTS = True
 # When a prefab references a script by name, these folders are checked FIRST.
 # If found: the existing .ts + .meta is copied, UUID rewritten in prefab.
 PRE_CONVERTED_DIRS: list[str] = [
-    "/Users/nhitieu/Documents/Projects/WPTGNewClient1/wptg-client/assets"
+    "/Users/nhitieu/NewProject_2/assets/bundles"
+    # "/Users/nhitieu/Documents/Projects/WPTGNewClient1/wptg-client/assets"
     # "/Users/nhitieu/NewProject_2/assets/bundles"
     # Add your pre-converted script folder paths here, e.g.:
     # "/Users/nhitieu/NewProject_2/assets/scripts",
@@ -82,8 +83,12 @@ class PreConvertedRegistry:
     Returns (js_path, new_uuid) if found, where new_uuid comes from the .js.meta.
     """
     def __init__(self):
-        self._map: dict[str, tuple] = {}  # stem_lower → (js_path, new_uuid)
+        self._map: dict[str, tuple] = {}      # stem_lower → (ts_path, uuid)
+        self._tex_map: dict[str, tuple] = {}   # stem_lower → (img_path, tex_uuid, sf_uuid)
         self._scan()
+
+    # Image extensions to scan for pre-converted textures
+    IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".psd"}
 
     def _scan(self):
         import os as _os
@@ -92,25 +97,45 @@ class PreConvertedRegistry:
             if not p.exists():
                 print(f"[pre-converted] WARNING: folder not found: {p}")
                 continue
-            count = 0
+            ts_count = tex_count = 0
             for dirpath, _, filenames in _os.walk(str(p), followlinks=True):
                 for fname in filenames:
-                    if not fname.endswith(".ts"):
-                        continue
-                    ts_path = Path(dirpath) / fname
-                    stem = ts_path.stem.lower()
-                    # Read UUID from sibling .ts.meta
-                    new_uuid = ""
-                    for meta_path in [Path(dirpath)/(fname+".meta"), ts_path.with_suffix(".meta")]:
-                        if meta_path.exists():
-                            try:
-                                new_uuid = json.loads(meta_path.read_text("utf-8")).get("uuid","")
-                            except Exception:
-                                pass
-                            break
-                    self._map[stem] = (ts_path, new_uuid)
-                    count += 1
-            print(f"[pre-converted] {p}: {count} .ts scripts indexed")
+                    fpath = Path(dirpath) / fname
+                    ext   = fpath.suffix.lower()
+
+                    # ── .ts scripts ──────────────────────────────────────────
+                    if ext == ".ts":
+                        stem = fpath.stem.lower()
+                        new_uuid = ""
+                        for meta_path in [Path(dirpath)/(fname+".meta"), fpath.with_suffix(".meta")]:
+                            if meta_path.exists():
+                                try:
+                                    new_uuid = json.loads(meta_path.read_text("utf-8")).get("uuid","")
+                                except Exception: pass
+                                break
+                        self._map[stem] = (fpath, new_uuid)
+                        ts_count += 1
+
+                    # ── texture files ─────────────────────────────────────────
+                    elif ext in self.IMG_EXTS:
+                        stem = fpath.stem.lower()
+                        meta_path = Path(dirpath) / (fname + ".meta")
+                        if not meta_path.exists():
+                            continue
+                        try:
+                            m = json.loads(meta_path.read_text("utf-8"))
+                        except Exception:
+                            continue
+                        # CC2 texture meta: uuid = texture uuid, subMetas[key].uuid = spriteFrame uuid
+                        tex_uuid   = m.get("uuid", "")
+                        sub_uuid   = ""
+                        for sub in m.get("subMetas", {}).values():
+                            sub_uuid = sub.get("uuid", "")
+                            break  # first spriteFrame sub
+                        self._tex_map[stem] = (fpath, tex_uuid, sub_uuid)
+                        tex_count += 1
+
+            print(f"[pre-converted] {p}: {ts_count} scripts, {tex_count} textures indexed")
 
     def find(self, ts_stem: str):
         """Look up by .ts filename stem (CC3 name). Returns (ts_path, new_uuid, matched_stem) or None.
@@ -143,6 +168,25 @@ class PreConvertedRegistry:
 
         return None
 
+
+    def find_texture(self, stem: str):
+        """Look up texture by stem name. Applies NAME_CONVENTIONS + EXTENSION_SUFFIXES.
+        Returns (img_path, tex_uuid, sf_uuid) or None.
+        """
+        stem_lower = stem.lower()
+        # 1. Exact
+        r = self._tex_map.get(stem_lower)
+        if r: return r
+        # 2. NAME_CONVENTIONS
+        _conv = {cc3.lower(): cc2 for cc3, cc2 in NAME_CONVENTIONS}
+        if stem_lower in _conv:
+            r = self._tex_map.get(_conv[stem_lower].lower())
+            if r: return r
+        # 3. EXTENSION_SUFFIXES
+        for suffix in EXTENSION_SUFFIXES:
+            r = self._tex_map.get((stem + suffix).lower())
+            if r: return r
+        return None
 
 # Singleton — built once at pipeline startup
 _pre_converted: PreConvertedRegistry | None = None
@@ -298,6 +342,57 @@ class AssetRegistry:
 # Asset copier
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _cc3_tex_meta_to_cc2(cc3_meta: dict, img_path: Path) -> dict:
+    """Convert CC3 image .meta format to CC2 texture .meta format."""
+    stem = img_path.stem
+    # Get spriteFrame data from CC3 subMetas f9941
+    sf_data = cc3_meta.get("subMetas", {}).get("f9941", {})
+    ud = sf_data.get("userData", {})
+    # CC2 texture uuid = new random-ish, but we reuse CC3 parent uuid for stability
+    tex_uuid = cc3_meta.get("uuid", "")
+    # Build CC2 spriteFrame sub-meta
+    sf_uuid = str(__import__("uuid").uuid4())
+    cc2_meta = {
+        "ver": "2.3.7",
+        "uuid": tex_uuid,
+        "importer": "texture",
+        "type": "sprite",
+        "wrapMode": "clamp",
+        "filterMode": "bilinear",
+        "premultiplyAlpha": False,
+        "genMipmaps": False,
+        "packable": True,
+        "width": ud.get("rawWidth", 0),
+        "height": ud.get("rawHeight", 0),
+        "platformSettings": {},
+        "subMetas": {
+            stem: {
+                "ver": "1.0.6",
+                "uuid": sf_uuid,
+                "importer": "sprite-frame",
+                "rawTextureUuid": tex_uuid,
+                "trimType": ud.get("trimType", "auto"),
+                "trimThreshold": ud.get("trimThreshold", 1),
+                "rotated": ud.get("rotated", False),
+                "offsetX": ud.get("offsetX", 0),
+                "offsetY": ud.get("offsetY", 0),
+                "trimX": ud.get("trimX", 0),
+                "trimY": ud.get("trimY", 0),
+                "width": ud.get("width", ud.get("rawWidth", 0)),
+                "height": ud.get("height", ud.get("rawHeight", 0)),
+                "rawWidth": ud.get("rawWidth", 0),
+                "rawHeight": ud.get("rawHeight", 0),
+                "borderTop": ud.get("borderTop", 0),
+                "borderBottom": ud.get("borderBottom", 0),
+                "borderLeft": ud.get("borderLeft", 0),
+                "borderRight": ud.get("borderRight", 0),
+                "subMetas": {}
+            }
+        }
+    }
+    return cc2_meta, sf_uuid
+
+
 class AssetCopier:
     """
     Tracks all UUIDs seen in prefab data, copies each asset (+ its .meta)
@@ -328,23 +423,64 @@ class AssetCopier:
             actual = src.with_suffix("")
             if actual.exists():
                 src = actual
+
         dst_dir = self.out_root / "assets" / cat
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst = dst_dir / src.name
         rel = str(dst.relative_to(self.out_root)).replace("\\", "/")
         self.uuid_map[uuid] = rel
 
+        # ── Textures: check PRE_CONVERTED_DIRS first, then convert meta ────────
+        img_exts = {".png", ".jpg", ".jpeg", ".webp"}
+        if src.suffix.lower() in img_exts and PRE_CONVERTED_DIRS:
+            pre_reg = get_pre_converted()
+            tex_result = pre_reg.find_texture(src.stem)
+            if tex_result:
+                pre_img, pre_tex_uuid, pre_sf_uuid = tex_result
+                # Copy pre-converted texture + its CC2 meta as-is
+                if not dst.exists():
+                    shutil.copy2(pre_img, dst)
+                pre_meta = pre_img.parent / (pre_img.name + ".meta")
+                meta_dst = dst.parent / (dst.name + ".meta")
+                if pre_meta.exists() and not meta_dst.exists():
+                    shutil.copy2(pre_meta, meta_dst)
+                # Rewire: old @f9941 UUID → new spriteFrame UUID from CC2 meta
+                if "@" in uuid and pre_sf_uuid:
+                    self.uuid_map[uuid] = pre_sf_uuid  # store new SF uuid for rewiring
+                if VERBOSE:
+                    print(f"    [pre-conv tex] {src.stem}: sf {uuid[-6:]} → {pre_sf_uuid[:8]}…")
+                return
+
+        # ── Default: copy asset file ──────────────────────────────────────────
         if not dst.exists():
             shutil.copy2(src, dst)
             if VERBOSE:
                 print(f"    [asset] {cat}/{src.name}  ({uuid[:8]}…)")
-        # Always copy .meta — try foo.png.meta then foo.meta
-        for meta_src in [src.parent / (src.name + ".meta"), src.with_suffix(src.suffix + ".meta")]:
-            if meta_src.exists():
-                meta_dst = dst.parent / (dst.name + ".meta")
-                if not meta_dst.exists():
+
+        # For textures: convert CC3 meta → CC2 meta format
+        meta_dst = dst.parent / (dst.name + ".meta")
+        if src.suffix.lower() in img_exts and not meta_dst.exists():
+            for meta_src in [src.parent / (src.name + ".meta"), src.with_suffix(src.suffix + ".meta")]:
+                if meta_src.exists():
+                    try:
+                        cc3_m = json.loads(meta_src.read_text("utf-8"))
+                        cc2_m, sf_uuid = _cc3_tex_meta_to_cc2(cc3_m, src)
+                        meta_dst.write_text(json.dumps(cc2_m, indent=2, ensure_ascii=False), "utf-8")
+                        # Map old @f9941 UUID → new CC2 spriteFrame UUID
+                        old_sf_uuid = f"{cc3_m.get('uuid','')}@f9941"
+                        self.uuid_map[old_sf_uuid] = sf_uuid
+                        if VERBOSE:
+                            print(f"    [meta conv] {src.stem}.png: sf {old_sf_uuid[-6:]} → {sf_uuid[:8]}…")
+                    except Exception as e:
+                        if VERBOSE: print(f"    [meta conv] error {src.stem}: {e}")
+                        shutil.copy2(meta_src, meta_dst)
+                    break
+        elif not meta_dst.exists():
+            # Non-texture assets: copy meta as-is
+            for meta_src in [src.parent / (src.name + ".meta"), src.with_suffix(src.suffix + ".meta")]:
+                if meta_src.exists():
                     shutil.copy2(meta_src, meta_dst)
-                break
+                    break
 
     def collect_from_prefab(self, data: list):
         """Walk entire prefab JSON and register every __uuid__ found."""
@@ -1335,6 +1471,22 @@ class Pipeline:
         # 1. collect + copy assets
         if self.copier:
             self.copier.collect_from_prefab(data)
+            # Rewire __uuid__ refs in prefab data using uuid_map
+            # (handles SpriteFrame @f9941 → new CC2 spriteFrame UUID)
+            if self.copier.uuid_map:
+                def _rewire_uuids(obj):
+                    if isinstance(obj, dict):
+                        u = obj.get("__uuid__")
+                        if u and u in self.copier.uuid_map:
+                            new_val = self.copier.uuid_map[u]
+                            # uuid_map may store relative path or new UUID string
+                            # Only rewrite if it looks like a UUID (not a path)
+                            if "/" not in new_val or len(new_val) < 40:
+                                obj["__uuid__"] = new_val
+                        for v in obj.values(): _rewire_uuids(v)
+                    elif isinstance(obj, list):
+                        for v in obj: _rewire_uuids(v)
+                _rewire_uuids(data)
 
         # 2. collect custom scripts bound on this prefab
         script_types = set()
