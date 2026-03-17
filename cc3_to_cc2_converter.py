@@ -1597,6 +1597,90 @@ class PrefabConverter:
         else:
             self.cc2.insert(0,h)
 
+    def _convert_events(self, events_raw: list) -> list:
+        """Convert CC3 clickEvents/checkEvents (list of __id__ refs to cc.ClickEvent)
+        to CC2 cc.EventHandler format, remapping target __id__ and resolving componentId.
+        """
+        result = []
+        for item in events_raw:
+            if not isinstance(item, dict):
+                result.append(item)
+                continue
+            # Inline cc.EventHandler already (CC2 format)
+            if item.get("__type__") == "cc.EventHandler":
+                result.append(item)
+                continue
+            # __id__ ref to cc.ClickEvent object
+            eid = item.get("__id__")
+            if eid is None:
+                result.append(item)
+                continue
+            if eid >= len(self.cc3) or not isinstance(self.cc3[eid], dict):
+                continue
+            ev = self.cc3[eid]
+            if ev.get("__type__") not in ("cc.ClickEvent", "cc.EventHandler"):
+                result.append(item)
+                continue
+            # Remap target node __id__
+            target_ref = None
+            tgt = ev.get("target", {})
+            if isinstance(tgt, dict) and "__id__" in tgt:
+                cc2_id = self._map.get(tgt["__id__"])
+                if cc2_id is not None:
+                    target_ref = {"__id__": cc2_id}
+            # Resolve component name from _componentId (compressed UUID → class name)
+            comp_id = ev.get("_componentId", ev.get("component", ""))
+            comp_name = ""  # default empty if can't resolve
+            # If comp_id looks like a readable class name (not UUID), use directly
+            _UUID_LIKE = re.compile(r'^[0-9a-zA-Z+/]{20,}$')
+            if comp_id and not _UUID_LIKE.match(comp_id):
+                comp_name = comp_id  # already a class name like "FacePanel"
+            elif comp_id and comp_id in self._uuid_script_map:
+                ts_path = self._uuid_script_map[comp_id]
+                # print("ts_path", ts_path)
+                # print("comp_id", comp_id)
+                # print("self._uuid_script_map", self._uuid_script_map)
+                # Try to extract actual class name from .ts source
+                # Fall back to file stem if not found
+                class_name = ts_path.stem
+                try:
+                    src = ts_path.read_text("utf-8")
+                    import re as _re
+                    # Find last @ccclass decorated class or last export class
+                    matches = _re.findall(r'export\s+class\s+(\w+)', src)
+                    if matches:
+                        class_name = matches[-1]  # last = main component class
+                except Exception:
+                    pass
+                # Apply EXTENSION_SUFFIXES only if that component exists in the prefab
+                # Check if class_name+suffix appears as a __type__ in cc3 data
+                all_types = {o.get("__type__","") for o in self.cc3 if isinstance(o, dict)}
+                for suffix in EXTENSION_SUFFIXES:
+                    candidate = class_name + suffix
+                    # Check exact match or UUID-mapped match
+                    found = candidate in all_types
+                    # print(f"    [debug] checking candidate: {candidate}, found: {found}"," all_types ",all_types)
+                    if not found:
+                        # Also check via uuid_script_map stem
+                        for ts_p in self._uuid_script_map.values():
+                            print("ts_p", ts_p.stem)
+                            print("candidate", candidate)
+                            if ts_p.stem == candidate:
+                                found = True
+                                break
+                    if found:
+                        class_name = candidate
+                        break
+                comp_name = class_name
+            result.append({
+                "__type__": "cc.ClickEvent",
+                "target": target_ref,
+                "component": comp_name,
+                "handler": ev.get("handler", ""),
+                "customEventData": ev.get("customEventData", "")
+            })
+        return result
+
     def _convert_nodes(self):
         for ci in sorted(self._map):
             o=self.cc3[ci]
@@ -1668,6 +1752,18 @@ class PrefabConverter:
                 else:
                     cc2c=fn(comp,ref(idx))
                 if cc2c is None: continue
+                # Post-process: convert event lists from CC3 __id__ refs → CC2 EventHandler
+                for ev_key in ("clickEvents","_clickEvents","checkEvents","slideEvents",
+                               "scrollEvents","pageEvents","editingDidBegan","editingChanged",
+                               "editingDidEnded","textChanged"):
+                    if ev_key in cc2c and isinstance(cc2c[ev_key], list):
+                        cc2c[ev_key] = self._convert_events(cc2c[ev_key])
+                # Post-process: remap _target/__target node refs
+                for tgt_key in ("_N$target", "_target", "target"):
+                    v = cc2c.get(tgt_key)
+                    if isinstance(v, dict) and "__id__" in v and len(v) == 1:
+                        cc2_id = self._map.get(v["__id__"])
+                        cc2c[tgt_key] = {"__id__": cc2_id} if cc2_id is not None else None
 
             ni=len(self.cc2); self.cc2.append(cc2c); comp_refs.append(ref(ni))
             if VERBOSE: print(f"      [{ni}] {cc2c.get('__type__','?')}")
