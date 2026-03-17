@@ -70,6 +70,7 @@ NAME_CONVENTIONS: list[tuple[str, str]] = [
 EXTENSION_SUFFIXES: list[str] = [
     "Portrait", "_Portrait",
     "Landscape", "_Landscape",
+    "Control","_Control"
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
