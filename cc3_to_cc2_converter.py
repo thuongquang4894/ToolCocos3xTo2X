@@ -58,8 +58,17 @@ PRE_CONVERTED_DIRS: list[str] = [
 # Lookup in PRE_CONVERTED_DIRS will use the CC2 name.
 # Format: ("CC3_stem", "CC2_stem")
 NAME_CONVENTIONS: list[tuple[str, str]] = [
-    ("BottomMenuHandler",         "BottomMenuHandlerPortrait"),
+    # ("BottomMenuHandler",         "BottomMenuHandlerPortrait"),
     # ("SomeOldName",               "SomeNewName"),
+]
+
+# ── Extension name suffixes ───────────────────────────────────────────────────
+# When looking up a script in PRE_CONVERTED_DIRS, also try appending these
+# suffixes to the stem. First match wins.
+# Example: "TopBar" → tries "TopBarPortrait", "TopBar_Portrait", "TopBarLandscape" …
+EXTENSION_SUFFIXES: list[str] = [
+    "Portrait", "_Portrait",
+    "Landscape", "_Landscape",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,17 +113,35 @@ class PreConvertedRegistry:
             print(f"[pre-converted] {p}: {count} .ts scripts indexed")
 
     def find(self, ts_stem: str):
-        """Look up by .ts filename stem (CC3 name). Returns (ts_path, new_uuid) or None.
-        Applies NAME_CONVENTIONS mapping before lookup.
+        """Look up by .ts filename stem (CC3 name). Returns (ts_path, new_uuid, matched_stem) or None.
+        Priority:
+          1. Exact match (case-insensitive)
+          2. NAME_CONVENTIONS explicit mapping
+          3. EXTENSION_SUFFIXES auto-try (e.g. TopBar → TopBarPortrait)
         """
-        # Build convention map (case-insensitive): cc3_stem_lower → cc2_stem_lower
-        _conv = {cc3.lower(): cc2.lower() for cc3, cc2 in NAME_CONVENTIONS}
-        lookup_stem = _conv.get(ts_stem.lower(), ts_stem.lower())
-        result = self._map.get(lookup_stem)
-        if result and lookup_stem != ts_stem.lower():
-            if VERBOSE:
-                print(f"    [convention] {ts_stem} → {lookup_stem}")
-        return result
+        stem_lower = ts_stem.lower()
+
+        # 1. Exact match
+        result = self._map.get(stem_lower)
+        if result:
+            return result[0], result[1], ts_stem
+
+        # 2. NAME_CONVENTIONS explicit mapping
+        _conv = {cc3.lower(): cc2 for cc3, cc2 in NAME_CONVENTIONS}
+        if stem_lower in _conv:
+            cc2_stem = _conv[stem_lower]
+            result = self._map.get(cc2_stem.lower())
+            if result:
+                return result[0], result[1], cc2_stem
+
+        # 3. EXTENSION_SUFFIXES auto-try
+        for suffix in EXTENSION_SUFFIXES:
+            candidate = (ts_stem + suffix).lower()
+            result = self._map.get(candidate)
+            if result:
+                return result[0], result[1], ts_stem + suffix
+
+        return None
 
 
 # Singleton — built once at pipeline startup
@@ -1339,14 +1366,14 @@ class Pipeline:
                 if ts_path:
                     result = pre_reg.find(ts_path.stem)
                     if result:
-                        _, new_uuid_hex = result  # hex UUID from .js.meta
+                        _, new_uuid_hex, matched_stem = result
                         new_uuid_compressed = _compress(new_uuid_hex)
                         if new_uuid_compressed and new_uuid_compressed != t:
                             uuid_rewrites[t] = new_uuid_compressed
                             # Check if name convention was applied
-                            _conv_map = {cc3.lower(): cc2 for cc3, cc2 in NAME_CONVENTIONS}
-                            cc2_name = _conv_map.get(ts_path.stem.lower(), ts_path.stem)
-                            conv_note = f" → {cc2_name}" if cc2_name != ts_path.stem else ""
+
+
+                            conv_note = f" → {matched_stem}" if matched_stem != ts_path.stem else ""
                             print(f"    [pre-conv] {ts_path.stem}{conv_note}: {t[:16]}… → {new_uuid_compressed[:16]}…")
             # Apply rewrites to prefab data: replace ALL occurrences of old UUID
             # (in __type__, typeUuid, and any string value that matches)
@@ -1428,7 +1455,7 @@ class Pipeline:
             pre_reg = get_pre_converted()
             result  = pre_reg.find(output_name)  # lookup by stem
             if result:
-                src_ts, new_uuid = result
+                src_ts, new_uuid, matched_stem = result
                 # Copy .ts file to output Scripts folder
                 dst_ts   = dst_scripts / src_ts.name
                 dst_ts_meta = dst_scripts / (src_ts.name + ".meta")
@@ -1438,7 +1465,7 @@ class Pipeline:
                 src_ts_meta = src_ts.parent / (src_ts.name + ".meta")
                 if src_ts_meta.exists() and not dst_ts_meta.exists():
                     shutil.copy2(src_ts_meta, dst_ts_meta)
-                print(f"    ✓ script  {src_ts.name}  [pre-converted, uuid={new_uuid[:8]}…]")
+                print(f"    ✓ script  {output_name}{(f" ({matched_stem})" if matched_stem != output_name else "")}.ts  [pre-converted, uuid={new_uuid[:8]}…]")
                 self.n_scripts += 1
                 return
 
