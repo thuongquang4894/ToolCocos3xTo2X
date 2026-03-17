@@ -47,7 +47,8 @@ DO_SCRIPTS = True
 # If found: the existing .js + .meta is used (no re-conversion),
 #           and the prefab's UUID is rewritten to match the new script's UUID.
 PRE_CONVERTED_DIRS: list[str] = [
-    "/Users/nhitieu/NewProject_2/assets/bundles"
+    "/Users/nhitieu/Documents/Projects/WPTGNewClient1/wptg-client/assets"
+    # "/Users/nhitieu/NewProject_2/assets/bundles"
     # Add your pre-converted script folder paths here, e.g.:
     # "/Users/nhitieu/NewProject_2/assets/scripts",
     # "/Users/nhitieu/SharedScripts/cc2",
@@ -1329,16 +1330,23 @@ class Pipeline:
                             print(f"      old __type__ : {t}")
                             print(f"      new_uuid_hex : {new_uuid_hex}")
                             print(f"      new compressed: {new_uuid_compressed}")
-            # Apply rewrites to prefab data: replace __type__ values
+            # Apply rewrites to prefab data: replace ALL occurrences of old UUID
+            # (in __type__, typeUuid, and any string value that matches)
             if uuid_rewrites:
                 def _rewrite(obj):
                     if isinstance(obj, dict):
-                        t = obj.get("__type__","")
-                        if t in uuid_rewrites:
-                            obj["__type__"] = uuid_rewrites[t]
-                        for v in obj.values(): _rewrite(v)
+                        for key in list(obj.keys()):
+                            v = obj[key]
+                            if isinstance(v, str) and v in uuid_rewrites:
+                                obj[key] = uuid_rewrites[v]
+                            else:
+                                _rewrite(v)
                     elif isinstance(obj, list):
-                        for v in obj: _rewrite(v)
+                        for i, v in enumerate(obj):
+                            if isinstance(v, str) and v in uuid_rewrites:
+                                obj[i] = uuid_rewrites[v]
+                            else:
+                                _rewrite(v)
                 _rewrite(data)
                 # Update script_types with new UUIDs
                 script_types = {uuid_rewrites.get(t, t) for t in script_types}
@@ -1401,15 +1409,11 @@ class Pipeline:
         if PRE_CONVERTED_DIRS:
             pre_reg = get_pre_converted()
             result  = pre_reg.find(output_name)  # lookup by stem
-            print(f"    [pre-conv] {ts_path.stem}:")
-            
             if result:
                 src_ts, new_uuid = result
                 # Copy .ts file to output Scripts folder
                 dst_ts   = dst_scripts / src_ts.name
                 dst_ts_meta = dst_scripts / (src_ts.name + ".meta")
-                print(f"    [pre-conv] {ts_path.stem}: {src_ts} {new_uuid}")
-                
                 if not dst_ts.exists():
                     shutil.copy2(src_ts, dst_ts)
                 # Copy .ts.meta as-is — it has the correct CC2 UUID
