@@ -85,10 +85,13 @@ class PreConvertedRegistry:
     def __init__(self):
         self._map: dict[str, tuple] = {}      # stem_lower → (ts_path, uuid)
         self._tex_map: dict[str, tuple] = {}   # stem_lower → (img_path, tex_uuid, sf_uuid)
+        self._font_map: dict[str, tuple] = {}  # stem_lower → (font_path, uuid)
         self._scan()
 
     # Image extensions to scan for pre-converted textures
     IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".psd"}
+    # Font extensions
+    FONT_EXTS = {".ttf", ".otf", ".fnt"}
 
     def _scan(self):
         import os as _os
@@ -126,16 +129,25 @@ class PreConvertedRegistry:
                             m = json.loads(meta_path.read_text("utf-8"))
                         except Exception:
                             continue
-                        # CC2 texture meta: uuid = texture uuid, subMetas[key].uuid = spriteFrame uuid
                         tex_uuid   = m.get("uuid", "")
                         sub_uuid   = ""
                         for sub in m.get("subMetas", {}).values():
                             sub_uuid = sub.get("uuid", "")
-                            break  # first spriteFrame sub
+                            break
                         self._tex_map[stem] = (fpath, tex_uuid, sub_uuid)
                         tex_count += 1
 
-            print(f"[pre-converted] {p}: {ts_count} scripts, {tex_count} textures indexed")
+                    elif ext in self.FONT_EXTS:
+                        stem = fpath.stem.lower()
+                        meta_path = Path(dirpath) / (fname + ".meta")
+                        font_uuid = ""
+                        if meta_path.exists():
+                            try:
+                                font_uuid = json.loads(meta_path.read_text("utf-8")).get("uuid","")
+                            except Exception: pass
+                        self._font_map[stem] = (fpath, font_uuid)
+
+            print(f"[pre-converted] {p}: {ts_count} scripts, {tex_count} textures, {len(self._font_map)} fonts indexed")
 
     def find(self, ts_stem: str):
         """Look up by .ts filename stem (CC3 name). Returns (ts_path, new_uuid, matched_stem) or None.
@@ -185,6 +197,20 @@ class PreConvertedRegistry:
         # 3. EXTENSION_SUFFIXES
         for suffix in EXTENSION_SUFFIXES:
             r = self._tex_map.get((stem + suffix).lower())
+            if r: return r
+        return None
+
+    def find_font(self, stem: str):
+        """Look up font by stem. Applies NAME_CONVENTIONS + EXTENSION_SUFFIXES."""
+        stem_lower = stem.lower()
+        r = self._font_map.get(stem_lower)
+        if r: return r
+        _conv = {cc3.lower(): cc2 for cc3, cc2 in NAME_CONVENTIONS}
+        if stem_lower in _conv:
+            r = self._font_map.get(_conv[stem_lower].lower())
+            if r: return r
+        for suffix in EXTENSION_SUFFIXES:
+            r = self._font_map.get((stem + suffix).lower())
             if r: return r
         return None
 
@@ -424,11 +450,25 @@ class AssetCopier:
             if actual.exists():
                 src = actual
 
-        dst_dir = self.out_root / "assets" / cat
+        dst_dir = self.out_root / "cloned_from_3x" / cat
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst = dst_dir / src.name
         rel = str(dst.relative_to(self.out_root)).replace("\\", "/")
         self.uuid_map[uuid] = rel
+
+        # ── Fonts: check PRE_CONVERTED_DIRS first ────────────────────────────────
+        font_exts = {".ttf", ".otf", ".fnt"}
+        if src.suffix.lower() in font_exts and PRE_CONVERTED_DIRS:
+            pre_reg = get_pre_converted()
+            font_result = pre_reg.find_font(src.stem)
+            if font_result:
+                _, new_uuid = font_result
+                # Font already in CC2 project — just rewire UUID, skip copy
+                if new_uuid:
+                    self.uuid_map[uuid] = new_uuid
+                if VERBOSE:
+                    print(f"    [pre-conv font] {src.stem}: skipping copy")
+                return
 
         # ── Textures: check PRE_CONVERTED_DIRS first, then convert meta ────────
         img_exts = {".png", ".jpg", ".jpeg", ".webp"}
@@ -898,7 +938,7 @@ def conv_widget(c,nr):
 
 def conv_sprite(c,nr):
     fc=c.get("_fillCenter",{})
-    return {"__type__":"cc.Sprite","_name":"","_objFlags":0,
+    result = {"__type__":"cc.Sprite","_name":"","_objFlags":0,
             "node":nr,"_enabled":_b(c,"_enabled",default=True),"_materials":[None],
             "_srcBlendFactor":_i(c,"_srcBlendFactor","srcBlendFactor",default=770),
             "_dstBlendFactor":_i(c,"_dstBlendFactor","dstBlendFactor",default=771),
@@ -910,6 +950,7 @@ def conv_sprite(c,nr):
             "_fillRange":_f(c,"_fillRange","fillRange"),
             "_isTrimmedMode":_b(c,"_isTrimmedMode","isTrimmedMode",default=True),
             "_atlas":_asset(c,"_atlas","atlas"),"_id":""}
+    return result
 
 def _lstyle(c):
     f=0
@@ -1317,6 +1358,18 @@ class PrefabConverter:
         if ui_opacity is not None:
             opacity = ui_opacity
 
+        # CC3 Sprite/Label components carry _color tint — apply to node color in CC2
+        for _,comp in get_all_components(self.cc3,n3):
+            t = comp.get("__type__","")
+            if any(x in t for x in ("cc.Sprite","cc.Label","cc.RichText")):
+                c = comp.get("_color", comp.get("color", {}))
+                if c and isinstance(c, dict) and any(k in c for k in ("r","g","b")):
+                    r = c.get("r", r)
+                    g = c.get("g", g)
+                    b = c.get("b", b)
+                    a = c.get("a", a)
+                break
+
         comp_refs=[]
         _warned = getattr(self, "_warned_types", None)
         if _warned is None:
@@ -1591,8 +1644,7 @@ class Pipeline:
                     print(f"    ⚠  Script '{class_name}.ts' not found in assets root")
                 return
 
-        dst_scripts = self._out_folder / "assets" / "Scripts"
-        dst_scripts.mkdir(parents=True, exist_ok=True)
+        dst_scripts = self._out_folder / "cloned_from_3x" / "Scripts"
         dst_js   = dst_scripts / (output_name + ".js")
         dst_meta = dst_scripts / (output_name + ".js.meta")
 
@@ -1602,20 +1654,14 @@ class Pipeline:
             result  = pre_reg.find(output_name)  # lookup by stem
             if result:
                 src_ts, new_uuid, matched_stem = result
-                # Copy .ts file to output Scripts folder
-                dst_ts   = dst_scripts / src_ts.name
-                dst_ts_meta = dst_scripts / (src_ts.name + ".meta")
-                if not dst_ts.exists():
-                    shutil.copy2(src_ts, dst_ts)
-                # Copy .ts.meta as-is — it has the correct CC2 UUID
-                src_ts_meta = src_ts.parent / (src_ts.name + ".meta")
-                if src_ts_meta.exists() and not dst_ts_meta.exists():
-                    shutil.copy2(src_ts_meta, dst_ts_meta)
-                print(f"    ✓ script  {output_name}{(f" ({matched_stem})" if matched_stem != output_name else "")}.ts  [pre-converted, uuid={new_uuid[:8]}…]")
+                # Script already exists in CC2 project — do NOT copy to output
+                conv_note = f" → {matched_stem}" if matched_stem != output_name else ""
+                print(f"    ✓ script  {output_name}{conv_note}  [pre-converted, skipping copy]")
                 self.n_scripts += 1
                 return
 
-        # ── Priority 2: convert from .ts source ───────────────────────────────
+        # ── Priority 2: convert from .ts source (not in pre-converted dirs) ──────
+        dst_scripts.mkdir(parents=True, exist_ok=True)
         src_meta_path = ts_path.parent / (ts_path.name + ".meta")
         if not src_meta_path.exists():
             src_meta_path = ts_path.with_suffix(".meta")
