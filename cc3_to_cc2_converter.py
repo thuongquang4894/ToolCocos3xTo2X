@@ -883,6 +883,16 @@ COMPONENT_MAP = [
     ("Light",              "SKIP"),
     ("RigidBody",          "SKIP"),
     ("Collider",           "SKIP"),
+    # CC3-only internals — silently ignored
+    ("UIOpacity",          "UIOPACITY"),   # opacity is baked into node, not a component in CC2
+    ("PrefabLink",         "SILENT_SKIP"), # CC3 prefab linking metadata, no CC2 equivalent
+    ("BlockInputEvents",   "BLOCKINPUT"),  # map to cc.BlockInputEvents in CC2
+    ("UICoordinateTracker","SILENT_SKIP"),
+    ("UIStaticBatch",      "SILENT_SKIP"),
+    ("LabelOutline",       "SILENT_SKIP"),
+    ("LabelShadow",        "SILENT_SKIP"),
+    ("SafeArea",           "SILENT_SKIP"),
+    ("ViewGroup",          "SILENT_SKIP"),
 ]
 
 # Types that are definitely engine builtins (don't treat as custom scripts)
@@ -951,20 +961,43 @@ class PrefabConverter:
         pr=n3.get("_parent")
         parent=ref(self._map[pr["__id__"]]) if (pr and "__id__" in pr and pr["__id__"] in self._map) else None
 
+        # Collect UIOpacity value to apply to node opacity
+        ui_opacity = None
+        for _,comp in get_all_components(self.cc3,n3):
+            if "UIOpacity" in comp.get("__type__",""):
+                ui_opacity = comp.get("_opacity", comp.get("opacity", None))
+                break
+        if ui_opacity is not None:
+            opacity = ui_opacity
+
         comp_refs=[]
+        _warned = getattr(self, "_warned_types", None)
+        if _warned is None:
+            self._warned_types = set()
+            _warned = self._warned_types
         for _,comp in get_all_components(self.cc3,n3):
             t=comp.get("__type__","")
             fn=find_converter(t)
             if fn is None: continue
-            if fn=="SKIP":
-                warnings.warn(f"Skipping (no CC2 equiv): {t}"); continue
-            if fn=="UNKNOWN":
+            if fn=="SILENT_SKIP": continue
+            if fn=="UIOPACITY": continue  # already handled above
+            if fn=="BLOCKINPUT":
+                cc2c={"__type__":"cc.BlockInputEvents","_name":"","_objFlags":0,"node":ref(idx),"_enabled":comp.get("_enabled",True),"_id":""}
+            elif fn=="SKIP":
+                if t not in _warned:
+                    _warned.add(t)
+                    warnings.warn(f"Skipping (no CC2 equiv): {t}")
+                continue
+            elif fn=="UNKNOWN":
                 if STRICT: raise ValueError(f"Unknown component: {t}")
-                warnings.warn(f"Unknown component passed through: {t}")
+                if t not in _warned:
+                    _warned.add(t)
+                    warnings.warn(f"Unknown component passed through: {t}")
                 cc2c=dict(comp); cc2c["__type__"]="cc3_UNKNOWN_"+t.split(".")[-1]; cc2c["node"]=ref(idx)
             else:
                 cc2c=fn(comp,ref(idx))
                 if cc2c is None: continue
+            print("find",t,"->",fn,"->",cc2c)
 
             ni=len(self.cc2); self.cc2.append(cc2c); comp_refs.append(ref(ni))
             if VERBOSE: print(f"      [{ni}] {cc2c.get('__type__','?')}")
@@ -1004,31 +1037,60 @@ class Pipeline:
 
         # script source lookup: class_short_name → Path(.ts)  AND  uuid → Path(.ts)
         self._script_map: dict[str, Path] = {}   # stem → path
-        self._uuid_script_map: dict[str, Path] = {}  # uuid → path
+        self._uuid_script_map: dict[str, Path] = {}  # uuid → path (all formats)
         if DO_SCRIPTS and assets_root and assets_root.exists():
-            for ts in assets_root.rglob("*.ts"):
-                self._script_map[ts.stem] = ts
-                # read sibling .meta to get uuid — try both Script.ts.meta and Script.meta
-                for meta_path in [ts.parent / (ts.name + ".meta"), ts.with_suffix(".meta")]:
-                    if meta_path.exists():
-                        try:
-                            m = json.loads(meta_path.read_text("utf-8"))
-                            uid = m.get("uuid")
-                            if uid:
-                                self._uuid_script_map[uid] = ts
-                                # also index sub-metas if any
-                                for sub in m.get("subMetas", {}).values():
-                                    sub_uid = sub.get("uuid")
-                                    if sub_uid:
-                                        self._uuid_script_map[sub_uid] = ts
-                        except Exception:
-                            pass
-                        break
+            import os as _os
+
+            _B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+            def _compress_uuid(hex_uuid: str) -> str:
+                """Convert hex UUID to CC3 compressed form (5 hex prefix + base64 pairs)."""
+                h = hex_uuid.replace('-', '')
+                if len(h) != 32:
+                    return hex_uuid
+                result = h[:5]
+                for k in range(5, 32, 3):
+                    val = int(h[k:k+3], 16)
+                    result += _B64[val >> 6] + _B64[val & 63]
+                return result
+
+            def _register(u: str, ts_path: Path):
+                if not u: return
+                self._uuid_script_map[u] = ts_path
+                compressed = _compress_uuid(u)
+                self._uuid_script_map[compressed] = ts_path
+                print("register",u,"->",compressed,"->",ts_path)
+
+            def _extract_uuids(obj, ts_path: Path):
+                if isinstance(obj, dict):
+                    _register(obj.get("uuid", ""), ts_path)
+                    for v in obj.values(): _extract_uuids(v, ts_path)
+                elif isinstance(obj, list):
+                    for v in obj: _extract_uuids(v, ts_path)
+
+            print(f"[script scan] Walking: {assets_root}")
+            ts_count = 0
+            for dirpath, _, filenames in _os.walk(str(assets_root), followlinks=True):
+                for fname in filenames:
+                    if not fname.endswith(".ts"):
+                        continue
+                    ts = Path(dirpath) / fname
+                    print("ts",ts)
+                    ts_count += 1
+                    self._script_map[ts.stem] = ts
+                    for meta_path in [Path(dirpath)/(fname+".meta"), ts.with_suffix(".meta")]:
+                        if meta_path.exists():
+                            try:
+                                _extract_uuids(json.loads(meta_path.read_text("utf-8")), ts)
+                            except Exception as e:
+                                if VERBOSE: print(f"[script scan]   meta error {meta_path.name}: {e}")
+                            break
+                    else:
+                        if VERBOSE: print(f"[script scan]   no meta: {ts}")
+            print(f"[script scan] Done — {ts_count} .ts files | {len(self._script_map)} by name | {len(self._uuid_script_map)} by UUID")
 
     # ── entry ─────────────────────────────────────────────────────────────────
     def run(self):
-        if DO_SCRIPTS:
-            print(f"Script index : {len(self._script_map)} by name, {len(self._uuid_script_map)} by UUID")
         if self.src.is_file():
             self._process_prefab(self.src, self.out if self.out.suffix else self.out/self.src.name)
         elif self.src.is_dir():
@@ -1091,22 +1153,24 @@ class Pipeline:
     _UUID_RE = re.compile(r'^[0-9a-fA-F+/]{20,}$')  # CC3 UUIDs are base64-ish, 20+ chars
 
     def _convert_script(self, class_name: str, prefab_out_dir: Path):
-        # If class_name looks like a UUID, resolve it via the uuid→ts map first
         ts_path = None
-        output_name = class_name  # default js output filename
+        output_name = class_name
 
         if self._UUID_RE.match(class_name):
             ts_path = self._uuid_script_map.get(class_name)
             if ts_path:
-                output_name = ts_path.stem  # use the actual filename, not the UUID
+                output_name = ts_path.stem
             else:
+                # UUID not found = likely a built-in CC3 engine component, not a user script
                 if VERBOSE:
-                    print(f"    ⚠  Script UUID '{class_name}' not found in assets root")
+                    print(f"    [skip] UUID '{class_name}' not in assets (built-in engine component?)")
                 return
         else:
             ts_path = self._script_map.get(class_name)
             if ts_path is None:
-                print(f"    ⚠  Script '{class_name}.ts' not found in assets root")
+                # Readable name not found = warn, user may need to add it manually
+                if VERBOSE:
+                    print(f"    ⚠  Script '{class_name}.ts' not found in assets root")
                 return
 
         dst_scripts = self._out_folder / "assets" / "Scripts"
