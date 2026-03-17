@@ -85,13 +85,16 @@ class PreConvertedRegistry:
     def __init__(self):
         self._map: dict[str, tuple] = {}      # stem_lower → (ts_path, uuid)
         self._tex_map: dict[str, tuple] = {}   # stem_lower → (img_path, tex_uuid, sf_uuid)
-        self._font_map: dict[str, tuple] = {}  # stem_lower → (font_path, uuid)
+        self._font_map: dict[str, tuple] = {}    # stem_lower → (font_path, uuid)
+        self._effect_map: dict[str, tuple] = {}  # stem_lower → (effect_path, uuid)
         self._scan()
 
     # Image extensions to scan for pre-converted textures
     IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".psd"}
     # Font extensions
     FONT_EXTS = {".ttf", ".otf", ".fnt"}
+    # Effect extensions
+    EFFECT_EXTS = {".effect", ".chunk"}
 
     def _scan(self):
         import os as _os
@@ -147,7 +150,17 @@ class PreConvertedRegistry:
                             except Exception: pass
                         self._font_map[stem] = (fpath, font_uuid)
 
-            print(f"[pre-converted] {p}: {ts_count} scripts, {tex_count} textures, {len(self._font_map)} fonts indexed")
+                    elif ext in self.EFFECT_EXTS:
+                        stem = fpath.stem.lower()
+                        meta_path = Path(dirpath) / (fname + ".meta")
+                        effect_uuid = ""
+                        if meta_path.exists():
+                            try:
+                                effect_uuid = json.loads(meta_path.read_text("utf-8")).get("uuid","")
+                            except Exception: pass
+                        self._effect_map[stem] = (fpath, effect_uuid)
+
+            print(f"[pre-converted] {p}: {ts_count} scripts, {tex_count} textures, {len(self._font_map)} fonts, {len(self._effect_map)} effects indexed")
 
     def find(self, ts_stem: str):
         """Look up by .ts filename stem (CC3 name). Returns (ts_path, new_uuid, matched_stem) or None.
@@ -211,6 +224,20 @@ class PreConvertedRegistry:
             if r: return r
         for suffix in EXTENSION_SUFFIXES:
             r = self._font_map.get((stem + suffix).lower())
+            if r: return r
+        return None
+
+    def find_effect(self, stem: str):
+        """Look up effect by stem. Applies NAME_CONVENTIONS + EXTENSION_SUFFIXES."""
+        stem_lower = stem.lower()
+        r = self._effect_map.get(stem_lower)
+        if r: return r
+        _conv = {cc3.lower(): cc2 for cc3, cc2 in NAME_CONVENTIONS}
+        if stem_lower in _conv:
+            r = self._effect_map.get(_conv[stem_lower].lower())
+            if r: return r
+        for suffix in EXTENSION_SUFFIXES:
+            r = self._effect_map.get((stem + suffix).lower())
             if r: return r
         return None
 
@@ -294,6 +321,7 @@ class AssetRegistry:
         ".atlas":"Spine",    ".skel":"Spine",     ".json": None,  # json may be spine/atlas
         ".tmx":  "TiledMaps",
         ".plist":"Particles",
+        ".effect":"Effects", ".chunk":"Effects",
     }
 
     def __init__(self, assets_root: Path):
@@ -468,6 +496,19 @@ class AssetCopier:
                     self.uuid_map[uuid] = new_uuid
                 if VERBOSE:
                     print(f"    [pre-conv font] {src.stem}: skipping copy")
+                return
+
+        # ── Effects: check PRE_CONVERTED_DIRS first ──────────────────────────────
+        effect_exts = {".effect", ".chunk"}
+        if src.suffix.lower() in effect_exts and PRE_CONVERTED_DIRS:
+            pre_reg = get_pre_converted()
+            effect_result = pre_reg.find_effect(src.stem)
+            if effect_result:
+                _, new_uuid = effect_result
+                if new_uuid:
+                    self.uuid_map[uuid] = new_uuid
+                if VERBOSE:
+                    print(f"    [pre-conv effect] {src.stem}: skipping copy")
                 return
 
         # ── Textures: check PRE_CONVERTED_DIRS first, then convert meta ────────
