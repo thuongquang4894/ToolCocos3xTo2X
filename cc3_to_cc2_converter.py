@@ -41,6 +41,15 @@ STRICT     = False
 DO_ASSETS  = True
 DO_SCRIPTS = True
 
+# ── CC2 internal/engine asset folders ───────────────────────────────────────
+# These folders are scanned for UUID lookup ONLY — assets are NOT copied to output
+# since they already exist inside the CC2 engine installation.
+# Add paths to CC2's built-in default-assets folders here.
+CC2_INTERNAL_DIRS: list[str] = [
+    "/Users/nhitieu/Documents/CocosCreator.app/Contents/Resources/static/default-assets",
+    # Add more CC2 engine paths if needed
+]
+
 # ── Pre-converted script folders ─────────────────────────────────────────────
 # Hard-code folders that already contain CC2 .ts scripts.
 # When a prefab references a script by name, these folders are checked FIRST.
@@ -266,6 +275,71 @@ class PreConvertedRegistry:
             r = self._prefab_map.get((stem + suffix).lower())
             if r: return r
         return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CC2 Internal Asset Registry
+# Scans CC2 engine default-assets folders — UUID lookup only, no file copy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CC2InternalRegistry:
+    """
+    Scans CC2_INTERNAL_DIRS for built-in engine assets.
+    Maps: stem_lower → (file_path, cc2_uuid, cc2_sf_uuid)
+    When a prefab references these UUIDs, we just rewire — no copy needed.
+    """
+    def __init__(self):
+        self._tex_map:  dict[str, tuple] = {}  # stem → (path, tex_uuid, sf_uuid)
+        self._misc_map: dict[str, tuple] = {}  # stem → (path, uuid)
+        self._scan()
+
+    def _scan(self):
+        import os as _os
+        IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+        total = 0
+        for folder in CC2_INTERNAL_DIRS:
+            p = Path(folder)
+            if not p.exists():
+                print(f"[cc2-internal] WARNING: not found: {p}")
+                continue
+            for dirpath, _, filenames in _os.walk(str(p), followlinks=True):
+                for fname in filenames:
+                    fpath = Path(dirpath) / fname
+                    ext = fpath.suffix.lower()
+                    meta_path = Path(dirpath) / (fname + ".meta")
+                    if not meta_path.exists():
+                        continue
+                    try:
+                        m = json.loads(meta_path.read_text("utf-8"))
+                    except Exception:
+                        continue
+                    uuid = m.get("uuid", "")
+                    stem = fpath.stem.lower()
+                    if ext in IMG_EXTS:
+                        sf_uuid = ""
+                        for sub in m.get("subMetas", {}).values():
+                            sf_uuid = sub.get("uuid", "")
+                            break
+                        self._tex_map[stem] = (fpath, uuid, sf_uuid)
+                    else:
+                        self._misc_map[stem] = (fpath, uuid)
+                    total += 1
+        print(f"[cc2-internal] {total} assets indexed from {len(CC2_INTERNAL_DIRS)} folder(s)")
+
+    def find_texture(self, stem: str):
+        return self._tex_map.get(stem.lower())
+
+    def find_any(self, stem: str):
+        return self._misc_map.get(stem.lower())
+
+
+_cc2_internal: CC2InternalRegistry | None = None
+
+def get_cc2_internal() -> CC2InternalRegistry:
+    global _cc2_internal
+    if _cc2_internal is None:
+        _cc2_internal = CC2InternalRegistry()
+    return _cc2_internal
+
 
 # Singleton — built once at pipeline startup
 _pre_converted: PreConvertedRegistry | None = None
@@ -590,6 +664,31 @@ class AssetCopier:
                         shutil.copy2(meta_src, meta_dst)
                     break
             return
+
+        # ── CC2 Internal assets: check engine folders — no copy needed ─────────
+        if CC2_INTERNAL_DIRS:
+            cc2_int = get_cc2_internal()
+            img_exts_int = {".png", ".jpg", ".jpeg", ".webp"}
+            if src.suffix.lower() in img_exts_int:
+                int_result = cc2_int.find_texture(src.stem)
+                if int_result:
+                    _, int_tex_uuid, int_sf_uuid = int_result
+                    if "@" in uuid and int_sf_uuid:
+                        self.uuid_map[uuid] = int_sf_uuid
+                    elif int_tex_uuid:
+                        self.uuid_map[uuid] = int_tex_uuid
+                    if VERBOSE:
+                        print(f"    [cc2-internal] {src.stem}: uuid rewired, no copy")
+                    return
+            else:
+                int_result = cc2_int.find_any(src.stem)
+                if int_result:
+                    _, int_uuid = int_result
+                    if int_uuid:
+                        self.uuid_map[uuid] = int_uuid
+                    if VERBOSE:
+                        print(f"    [cc2-internal] {src.stem}: uuid rewired, no copy")
+                    return
 
         # ── Fonts: check PRE_CONVERTED_DIRS first ────────────────────────────────
         font_exts = {".ttf", ".otf", ".fnt"}
