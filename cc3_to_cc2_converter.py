@@ -41,6 +41,74 @@ STRICT     = False
 DO_ASSETS  = True
 DO_SCRIPTS = True
 
+# ── Pre-converted script folders ─────────────────────────────────────────────
+# Hard-code folders that already contain CC2-converted .js scripts.
+# When a prefab references a script by name, these folders are checked FIRST.
+# If found: the existing .js + .meta is used (no re-conversion),
+#           and the prefab's UUID is rewritten to match the new script's UUID.
+PRE_CONVERTED_DIRS: list[str] = [
+    "/Users/nhitieu/NewProject_2/assets/bundles"
+    # Add your pre-converted script folder paths here, e.g.:
+    # "/Users/nhitieu/NewProject_2/assets/scripts",
+    # "/Users/nhitieu/SharedScripts/cc2",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-converted script registry
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PreConvertedRegistry:
+    """
+    Scans PRE_CONVERTED_DIRS for already-converted .js scripts.
+    Lookup is by stem name (case-insensitive) matching the original .ts filename.
+    Returns (js_path, new_uuid) if found, where new_uuid comes from the .js.meta.
+    """
+    def __init__(self):
+        self._map: dict[str, tuple] = {}  # stem_lower → (js_path, new_uuid)
+        self._scan()
+
+    def _scan(self):
+        import os as _os
+        for folder in PRE_CONVERTED_DIRS:
+            p = Path(folder)
+            if not p.exists():
+                print(f"[pre-converted] WARNING: folder not found: {p}")
+                continue
+            count = 0
+            for dirpath, _, filenames in _os.walk(str(p), followlinks=True):
+                for fname in filenames:
+                    if not fname.endswith(".ts"):
+                        continue
+                    ts_path = Path(dirpath) / fname
+                    stem = ts_path.stem.lower()
+                    # Read UUID from sibling .ts.meta
+                    new_uuid = ""
+                    for meta_path in [Path(dirpath)/(fname+".meta"), ts_path.with_suffix(".meta")]:
+                        if meta_path.exists():
+                            try:
+                                new_uuid = json.loads(meta_path.read_text("utf-8")).get("uuid","")
+                            except Exception:
+                                pass
+                            break
+                    self._map[stem] = (ts_path, new_uuid)
+                    count += 1
+            print(f"[pre-converted] {p}: {count} .ts scripts indexed")
+
+    def find(self, ts_stem: str):
+        """Look up by .ts filename stem. Returns (ts_path, new_uuid) or None."""
+        return self._map.get(ts_stem.lower())
+
+
+# Singleton — built once at pipeline startup
+_pre_converted: PreConvertedRegistry | None = None
+
+def get_pre_converted() -> PreConvertedRegistry:
+    global _pre_converted
+    if _pre_converted is None:
+        _pre_converted = PreConvertedRegistry()
+    return _pre_converted
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Primitive helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,40 +190,63 @@ class AssetRegistry:
     def _scan(self):
         if not self.root or not self.root.exists():
             return
-        for meta in self.root.rglob("*.meta"):
-            try:
-                m = json.loads(meta.read_text("utf-8"))
-            except Exception:
-                continue
-            uuid = m.get("uuid")
-            if not uuid:
-                continue
-            asset_path = meta.with_suffix("")   # strip .meta
-            if not asset_path.exists():
-                # some .meta files describe sub-assets; keep the meta at least
-                asset_path = meta
-            ext = asset_path.suffix.lower()
-            cat = self.EXT_CATEGORY.get(ext)
-            # refine json: if meta has "type" field use it
-            if ext == ".json":
-                mtype = m.get("type","")
-                if "DragonBones" in mtype:  cat = "Spine"
-                elif "spine"     in mtype.lower(): cat = "Spine"
-                elif "anim"      in mtype.lower(): cat = "Animations"
-                else: cat = "Misc"
-            if cat is None:
-                cat = "Misc"
-            self.uuid_to_path[uuid] = asset_path
-            self.uuid_to_cat[uuid]  = cat
-            # sub-asset uuids inside the meta (spriteFrames, etc.)
-            for sub in m.get("subMetas", {}).values():
-                sub_uuid = sub.get("uuid")
-                if sub_uuid:
+        import os as _os
+        for dirpath, _, filenames in _os.walk(str(self.root), followlinks=True):
+            for fname in filenames:
+                if not fname.endswith(".meta"):
+                    continue
+                meta = Path(dirpath) / fname
+                try:
+                    m = json.loads(meta.read_text("utf-8"))
+                except Exception:
+                    continue
+                uuid = m.get("uuid")
+                if not uuid:
+                    continue
+                asset_path = meta.with_suffix("")   # strip .meta → actual asset file
+                if not asset_path.exists():
+                    asset_path = meta               # meta-only asset (sub-asset def)
+                ext = asset_path.suffix.lower()
+                if ext == ".meta":
+                    # try stripping one more suffix e.g. foo.png.meta → foo.png
+                    ext = Path(asset_path.stem).suffix.lower()
+                cat = self.EXT_CATEGORY.get(ext)
+                if ext == ".json":
+                    mtype = m.get("userData", {}).get("type", m.get("type",""))
+                    if "DragonBones" in mtype:        cat = "Spine"
+                    elif "spine"     in mtype.lower(): cat = "Spine"
+                    elif "anim"      in mtype.lower(): cat = "Animations"
+                    else:                              cat = "Misc"
+                if cat is None:
+                    cat = "Misc"
+                self.uuid_to_path[uuid] = asset_path
+                self.uuid_to_cat[uuid]  = cat
+                # CC3 sub-asset UUIDs: format is "parentUUID@subId"
+                # stored inside subMetas[subId].uuid
+                for sub_key, sub in m.get("subMetas", {}).items():
+                    sub_uuid = sub.get("uuid")
+                    if not sub_uuid:
+                        # build it explicitly if missing
+                        sub_uuid = f"{uuid}@{sub_key}"
                     self.uuid_to_path[sub_uuid] = asset_path
                     self.uuid_to_cat[sub_uuid]  = cat
+                    # also index without parent prefix (just the @subId part)
+                    self.uuid_to_path[f"{uuid}@{sub_key}"] = asset_path
+                    self.uuid_to_cat[f"{uuid}@{sub_key}"]  = cat
 
     def resolve(self, uuid: str):
-        return self.uuid_to_path.get(uuid), self.uuid_to_cat.get(uuid, "Misc")
+        # Direct lookup first
+        path = self.uuid_to_path.get(uuid)
+        if path:
+            return path, self.uuid_to_cat.get(uuid, "Misc")
+        # Try stripping @subId suffix — resolve to parent asset file
+        if "@" in uuid:
+            parent_uuid = uuid.split("@")[0]
+            path = self.uuid_to_path.get(parent_uuid)
+            if path:
+                return path, self.uuid_to_cat.get(parent_uuid, "Misc")
+        return None, "Misc"
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,28 +269,37 @@ class AssetCopier:
         if not uuid or uuid in self._done:
             return
         self._done.add(uuid)
+        # For sub-asset UUIDs (parentUUID@subId), also register the parent asset
+        if "@" in uuid:
+            parent_uuid = uuid.split("@")[0]
+            self.register(parent_uuid)
         src, cat = self.reg.resolve(uuid)
         if src is None:
             if VERBOSE:
                 print(f"    [asset] UUID {uuid[:8]}… not found in registry")
             return
+        # src may be a .meta file for sub-assets — resolve to actual asset file
+        if src.suffix == ".meta":
+            actual = src.with_suffix("")
+            if actual.exists():
+                src = actual
         dst_dir = self.out_root / "assets" / cat
         dst_dir.mkdir(parents=True, exist_ok=True)
-        dst     = dst_dir / src.name
-        rel     = str(dst.relative_to(self.out_root)).replace("\\","/")
+        dst = dst_dir / src.name
+        rel = str(dst.relative_to(self.out_root)).replace("\\", "/")
         self.uuid_map[uuid] = rel
 
         if not dst.exists():
             shutil.copy2(src, dst)
             if VERBOSE:
                 print(f"    [asset] {cat}/{src.name}  ({uuid[:8]}…)")
-        # copy .meta too
-        meta_src = src.parent / (src.name + ".meta")
-        if not meta_src.exists():
-            meta_src = src.with_suffix(src.suffix + ".meta")
-        meta_dst = dst.parent / (dst.name + ".meta")
-        if meta_src.exists() and not meta_dst.exists():
-            shutil.copy2(meta_src, meta_dst)
+        # Always copy .meta — try foo.png.meta then foo.meta
+        for meta_src in [src.parent / (src.name + ".meta"), src.with_suffix(src.suffix + ".meta")]:
+            if meta_src.exists():
+                meta_dst = dst.parent / (dst.name + ".meta")
+                if not meta_dst.exists():
+                    shutil.copy2(meta_src, meta_dst)
+                break
 
     def collect_from_prefab(self, data: list):
         """Walk entire prefab JSON and register every __uuid__ found."""
@@ -263,54 +363,91 @@ def convert_script(ts_src: str, class_name: str = "") -> str:
                 nm = nm.strip().split(" as ")[-1].strip()  # handle "X as Y"
                 if nm: _cc_names.add(nm)
             continue
-        # import { X } from 'other'
+        # import { X, Y as Z } from 'other'
         m = re.match(r"""^\s*import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?\s*$""", line)
         if m:
-            names = [n.strip() for n in m.group(1).split(",") if n.strip()]
-            mod   = m.group(2)
-            for nm in names:
-                import_lines.append(f'const {nm} = require("{mod}");')
+            names_raw = [n.strip() for n in m.group(1).split(",") if n.strip()]
+            mod = m.group(2)
+            # skip cc/env and other cc internal modules
+            if mod in ("cc/env", "cc/editor"):
+                continue
+            seen = set()
+            for nm in names_raw:
+                # handle "X as Y" — require once with original name, alias separately
+                parts = re.split(r'\s+as\s+', nm)
+                original = parts[0].strip()
+                local    = parts[-1].strip()
+                if original and original not in seen:
+                    seen.add(original)
+                    import_lines.append(f'const {original} = require("{mod}");')
+                # if aliased (X as Y), add: const Y = X;
+                if local != original and local and local not in seen:
+                    seen.add(local)
+                    import_lines.append(f'const {local} = {original};')
             continue
         m2 = re.match(r"""^\s*import\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?\s*$""", line)
         if m2:
-            if m2.group(2) != "cc":
-                import_lines.append(f'const {m2.group(1)} = require("{m2.group(2)}");')
+            mod2 = m2.group(2)
+            # Skip CC internal modules with no CC2 equivalent
+            if mod2 not in ("cc", "cc/env", "cc/editor", "cc/physics", "cc/tween"):
+                import_lines.append(f'const {m2.group(1)} = require("{mod2}");')
             continue
         # strip export keyword
         line2 = re.sub(r'^\s*export\s+(default\s+)?','', line)
         remaining.append(line2)
 
     # ── pass 2: parse class, properties, methods ─────────────────────────────
-    prop_buf   = []      # accumulates @property lines
-    method_buf = []      # lines of current method
-    methods    = []      # list of (name, is_lifecycle, body_str)
-    in_prop    = False
+    # Collect ALL classes in the file
+    all_classes = []   # list of (name, base, props_dict, methods_list)
+    prop_buf   = []
+    method_buf = []
+    methods    = []
     in_method  = False
     method_name= ""
     method_depth = 0
     class_name_found = ""
     base_found  = ""
+    props = {}
 
     i = 0
     while i < len(remaining):
         line = remaining[i]
         stripped = line.strip()
 
-        # @ccclass — skip
+        # @ccclass — skip decorator
         if re.match(r'@ccclass', stripped):
             i += 1; continue
-
-        # @property(...)  or  @property
-        if re.match(r'@property', stripped):
-            prop_buf.append(stripped)
+        # @disallowMultiple @menu etc — skip
+        if re.match(r'@(disallow|menu|executionOrder)', stripped):
             i += 1; continue
 
-        # class declaration
+        # @property(...)  or  @property — may be inline: @property(X) fieldName: Type = val;
+        if re.match(r'@property', stripped):
+            # Check if field definition is on the same line: @property(...) name: Type = val;
+            inline_m = re.match(r'@property[^\s]*\s+(\w+)\s*(?::\s*[\w.<>\[\]|?]+)?\s*(?:=\s*(.+?))?;?\s*$', stripped)
+            if inline_m:
+                pname   = inline_m.group(1)
+                pdefval = (inline_m.group(2) or "null").rstrip(";").strip()
+                # extract type from @property(Type) 
+                type_m  = re.match(r'@property\(([^)]+)\)', stripped)
+                ptype   = type_m.group(1).strip() if type_m else ""
+                cc2type = DECORATOR_TYPE_MAP.get(ptype, None)
+                tooltip_m = re.search(r"tooltip\s*:\s*[\'\"]([^\'\"]+)[\'\"]" , stripped)
+                tooltip = tooltip_m.group(1) if tooltip_m else ""
+                props[pname] = {"cc2type": cc2type, "default": pdefval, "tooltip": tooltip}
+            else:
+                prop_buf.append(stripped)
+            i += 1; continue
+
+        # class declaration — save previous class if any, start new one
         m = re.match(r'class\s+(\w+)(?:\s+extends\s+([\w.]+))?', stripped)
-        if m and not in_class:
+        if m:
+            if class_name_found:
+                all_classes.append((class_name_found, base_found, props, methods))
             class_name_found = m.group(1)
             base_found       = m.group(2) or "cc.Component"
             in_class         = True
+            props = {}; methods = []; prop_buf = []; method_buf = []
             i += 1; continue
 
         if not in_class:
@@ -338,9 +475,10 @@ def convert_script(ts_src: str, class_name: str = "") -> str:
 
         prop_buf = []
 
-        # method declaration
-        _KEYWORDS = {"if","else","for","while","switch","try","catch","return","new","typeof","instanceof"}
-        mm = re.match(r'^(async\s+)?(\w+)\s*\(([^)]*)\)\s*(?::\s*[\w<>\[\]|]+\s*)?\s*\{', stripped)
+        # method declaration — strip modifiers first so 'protected onLoad' → 'onLoad'
+        _KEYWORDS = {"if","else","for","while","switch","try","catch","return","new","typeof","instanceof","constructor"}
+        stripped_m = re.sub(r'^(async\s+|private\s+|protected\s+|public\s+|static\s+|override\s+|abstract\s+)+', '', stripped)
+        mm = re.match(r'^(async\s+)?(\w+)\s*\(([^)]*)\)\s*(?::\s*[\w<>\[\]|?]+\s*)?\s*\{', stripped_m)
         if mm and not in_method and mm.group(2) not in _KEYWORDS:
             method_name  = mm.group(2)
             in_method    = True
@@ -361,16 +499,70 @@ def convert_script(ts_src: str, class_name: str = "") -> str:
 
         i += 1
 
+    # Save last collected class
+    if class_name_found:
+        all_classes.append((class_name_found, base_found, props, methods))
+    if not all_classes:
+        all_classes = [(class_name or 'MyComponent', 'cc.Component', {}, [])]
+    # Use last class as the main export (it's the main component)
+    cn, base_raw, props, methods = all_classes[-1]
+    cn = cn or class_name or 'MyComponent'
+
     # ── pass 3: render CC2 cc.Class(...) ─────────────────────────────────────
-    cn   = class_name_found or class_name or "MyComponent"
-    base_raw = base_found or "cc.Component"
+    base_raw = base_raw or 'cc.Component'
+
     # resolve base: if it's a plain name imported from cc, prefix with cc.
-    if base_raw in _cc_names or (base_raw == "Component"):
+    if base_raw in _cc_names or base_raw == "Component":
         base = "cc.Component"
     elif "." not in base_raw:
-        base = base_raw   # user script base – keep as-is
+        base = base_raw
     else:
         base = base_raw
+
+    def _render_class(cn, base, props, methods, _cc_names):
+        lines_out = [f'var {cn} = cc.Class({{', f'    name: "{cn}",', f'    extends: {base},', ""]
+        if props:
+            lines_out.append("    properties: {")
+            for pname, info in props.items():
+                t    = info["cc2type"]
+                dflt = info["default"]
+                tip  = info["tooltip"]
+                if t and t in _cc_names:
+                    t = "cc." + t
+                if t:
+                    lines_out.append(f"        {pname}: {{")
+                    lines_out.append(f"            default: {dflt},")
+                    lines_out.append(f"            type: {t},")
+                    if tip:
+                        lines_out.append(f'            tooltip: "{tip}",')
+                    lines_out.append("        },")
+                else:
+                    lines_out.append(f"        {pname}: {dflt},")
+            lines_out += ["    },", ""]
+
+        for idx2, (mname, is_lifecycle, mbody) in enumerate(methods):
+            sig_m = re.search(r'\b' + re.escape(mname) + r'\s*\(([^)]*)\)', mbody)
+            params = ""
+            if sig_m:
+                raw_params = sig_m.group(1)
+                clean_params = []
+                for param in raw_params.split(","):
+                    param = param.strip()
+                    param = re.sub(r'\s*:\s*[\w.<>\[\]|?]+', '', param)
+                    param = re.sub(r'\s*=\s*.+', '', param).strip()
+                    if param and param != '...': clean_params.append(param)
+                params = ", ".join(clean_params)
+
+            trailing_comma = "," if idx2 < len(methods) - 1 else ""
+            lines_out.append(f"    {mname}: function({params}) {{")
+            body_src = mbody.splitlines()
+            for ml in body_src[1:]:
+                lines_out.append("    " + ml)
+            if lines_out[-1].rstrip().endswith("}"):
+                lines_out[-1] = lines_out[-1].rstrip() + trailing_comma
+            lines_out.append("")
+        lines_out.append("});")
+        return lines_out
 
     result_lines = [
         f"// AUTO-CONVERTED from TypeScript (CC3) → JavaScript (CC2)",
@@ -378,73 +570,53 @@ def convert_script(ts_src: str, class_name: str = "") -> str:
         f"// Converter: cc3_to_cc2_converter.py",
         "",
     ]
-    if import_lines:
-        result_lines += import_lines + [""]
+    # deduplicate imports — same local name keeps only first occurrence
+    seen_names: set = set()
+    deduped: list = []
+    for imp in import_lines:
+        m = re.match(r'const (\w+) = require', imp)
+        if m:
+            if m.group(1) not in seen_names:
+                seen_names.add(m.group(1))
+                deduped.append(imp)
+        else:
+            deduped.append(imp)
+    result_lines += deduped + [""]
 
-    result_lines += [f'var {cn} = cc.Class({{', f'    name: "{cn}",', f'    extends: {base},', ""]
+    # Render all helper classes first, then the main class last
+    for helper_cn, helper_base_raw, helper_props, helper_methods in all_classes[:-1]:
+        helper_base = helper_base_raw
+        if helper_base in _cc_names or helper_base == "Component":
+            helper_base = "cc.Component"
+        result_lines += _render_class(helper_cn, helper_base, helper_props, helper_methods, _cc_names)
+        result_lines += [""]
 
-    # properties block
-    if props:
-        result_lines.append("    properties: {")
-        for pname, info in props.items():
-            t    = info["cc2type"]
-            dflt = info["default"]
-            tip  = info["tooltip"]
-            # resolve type: if it's a cc-imported name, prefix with cc.
-            if t and t in _cc_names:
-                t = "cc." + t
-            if t:
-                result_lines.append(f"        {pname}: {{")
-                result_lines.append(f"            default: {dflt},")
-                result_lines.append(f"            type: {t},")
-                if tip:
-                    result_lines.append(f'            tooltip: "{tip}",')
-                result_lines.append("        },")
-            else:
-                result_lines.append(f"        {pname}: {dflt},")
-        result_lines += ["    },", ""]
-
-    # methods – extract original param list from source
-    for idx2, (mname, is_lifecycle, mbody) in enumerate(methods):
-        # try to recover parameter names from the method signature
-        sig_m = re.search(r'\b' + re.escape(mname) + r'\s*\(([^)]*)\)', mbody)
-        params = ""
-        if sig_m:
-            raw_params = sig_m.group(1)
-            # strip type annotations from each param  "points: number" → "points"
-            clean_params = []
-            for param in raw_params.split(","):
-                param = param.strip()
-                param = re.sub(r'\s*:\s*[\w.<>\[\]|]+', '', param)
-                param = re.sub(r'\s*=\s*.+', '', param).strip()
-                if param: clean_params.append(param)
-            params = ", ".join(clean_params)
-
-        trailing_comma = "," if idx2 < len(methods) - 1 else ""
-        result_lines.append(f"    {mname}: function({params}) {{")
-        body_src = mbody.splitlines()
-        # skip the opening brace line (already added above)
-        for ml in body_src[1:]:
-            result_lines.append("    " + ml)
-        result_lines[-1] = result_lines[-1] + trailing_comma   # add comma after closing }
-        result_lines.append("")
-
-    result_lines += ["});", "", f"module.exports = {cn};"]
+    result_lines += _render_class(cn, base, props, methods, _cc_names)
+    result_lines += ["", f"module.exports = {cn};"]
     return "\n".join(result_lines)
 
 
 def _strip_types_from_line(line: str) -> str:
     """Remove common TypeScript type annotations from a single line."""
+    # super.method(...) → this._super(...)  (CC2 uses this._super for parent calls)
+    line = re.sub(r'\bsuper\.', 'this._super.', line)
+    # super(...) alone → this._super(...)
+    line = re.sub(r'\bsuper\(', 'this._super(', line)
+    # EDITOR (from cc/env) → CC_EDITOR  (CC2 global)
+    line = re.sub(r'\bEDITOR\b', 'CC_EDITOR', line)
     # remove  : Type  in variable declarations and params (not in ternary)
-    line = re.sub(r':\s*(?:readonly\s+)?[\w.<>\[\]|]+(?=\s*[=,);{])', '', line)
-    # remove <T> generics in casts
-    line = re.sub(r'<[\w.<>\[\], ]+>', '', line)
-    # remove 'as Type'
+    line = re.sub(r':\s*(?:readonly\s+)?[\w.<>\[\]|]+(?=\s*[=,);\[{])', '', line)
+    # remove <T> generics in method calls and casts  e.g. getComponent<Sprite>()
+    line = re.sub(r'<[\w.<>\[\], ]+>(?=\s*[\(\)])', '', line)
+    # remove 'as Type' casts
     line = re.sub(r'\bas\s+\w[\w.<>]*', '', line)
     # remove access modifiers
-    line = re.sub(r'\b(private|protected|public|readonly|static)\s+', '', line)
+    line = re.sub(r'\b(private|protected|public|readonly|static|override|abstract)\s+', '', line)
     # remove 'let' → 'var', keep const
     line = re.sub(r'\blet\b', 'var', line)
+    # remove non-null assertion operator
+    line = re.sub(r'(\w)!\.(\w)', r'\1.\2', line)
+    line = re.sub(r'(\w)!([;,\)\]])', r'\1\2', line)
     return line
 
 
@@ -1126,8 +1298,50 @@ class Pipeline:
                 if not isinstance(obj,dict): continue
                 t=obj.get("__type__","")
                 if t and not any(t.startswith(p) for p in _BUILTIN_PREFIXES):
-
                     script_types.add(t)
+
+        # 2b. Rewrite UUIDs in prefab data for pre-converted scripts
+        #     Find ts stem from uuid_script_map, look up pre-converted registry,
+        #     replace old compressed UUID with new compressed UUID from the pre-converted .js.meta
+        if DO_SCRIPTS and PRE_CONVERTED_DIRS:
+            _B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+            def _compress(u: str) -> str:
+                h = u.replace('-', '')
+                if len(h) != 32: return u
+                result = h[:5]
+                for k in range(5, 32, 3):
+                    val = int(h[k:k+3], 16)
+                    result += _B64[val >> 6] + _B64[val & 63]
+                return result
+
+            pre_reg = get_pre_converted()
+            uuid_rewrites: dict[str, str] = {}  # old_compressed_uuid → new_compressed_uuid
+            for t in script_types:
+                ts_path = self._uuid_script_map.get(t)
+                if ts_path:
+                    result = pre_reg.find(ts_path.stem)
+                    if result:
+                        _, new_uuid_hex = result  # hex UUID from .js.meta
+                        new_uuid_compressed = _compress(new_uuid_hex)
+                        if new_uuid_compressed and new_uuid_compressed != t:
+                            uuid_rewrites[t] = new_uuid_compressed
+                            print(f"    [pre-conv] {ts_path.stem}:")
+                            print(f"      old __type__ : {t}")
+                            print(f"      new_uuid_hex : {new_uuid_hex}")
+                            print(f"      new compressed: {new_uuid_compressed}")
+            # Apply rewrites to prefab data: replace __type__ values
+            if uuid_rewrites:
+                def _rewrite(obj):
+                    if isinstance(obj, dict):
+                        t = obj.get("__type__","")
+                        if t in uuid_rewrites:
+                            obj["__type__"] = uuid_rewrites[t]
+                        for v in obj.values(): _rewrite(v)
+                    elif isinstance(obj, list):
+                        for v in obj: _rewrite(v)
+                _rewrite(data)
+                # Update script_types with new UUIDs
+                script_types = {uuid_rewrites.get(t, t) for t in script_types}
 
         # 3. convert prefab
         try:
@@ -1149,46 +1363,72 @@ class Pipeline:
 
     # ── script conversion ─────────────────────────────────────────────────────
     _UUID_RE = re.compile(r'^[0-9a-zA-Z+/]{23}$')  # CC3 compressed UUIDs: exactly 23 base64 chars
+    # ── script conversion ─────────────────────────────────────────────────────
+    _UUID_RE = re.compile(r'^[0-9a-zA-Z+/]{23}$')  # CC3 compressed UUIDs: exactly 23 base64 chars
 
     def _convert_script(self, class_name: str, prefab_out_dir: Path):
+        """Find, copy, or convert a script referenced by a prefab.
+        Priority:
+          1. Pre-converted dirs (by ts stem name) — copy .js + .meta as-is
+          2. CC3 assets root — convert .ts → .js
+        """
         ts_path = None
         output_name = class_name
-        print("convert script",class_name)
-        print("convert _UUID_RE",self._UUID_RE)
-        print("convert _uuid_script_map",self._uuid_script_map)
-        if self._UUID_RE.match(class_name):
-            ts_path = self._uuid_script_map.get(class_name)
-            print("convert ts_path",ts_path)
+
+        # Resolve UUID → ts_path
+        ts_path = self._uuid_script_map.get(class_name)
+        if ts_path:
+            output_name = ts_path.stem
+        elif self._UUID_RE.match(class_name):
+            if VERBOSE:
+                print(f"    [skip] UUID '{class_name}' not in assets (built-in?)")
+            return
+        else:
+            ts_path = self._script_map.get(class_name)
             if ts_path:
                 output_name = ts_path.stem
             else:
-                if VERBOSE:
-                    print(f"    [skip] UUID '{class_name}' not in assets (built-in engine component?)")
-                return
-        else:
-            print("convert _script_map--",self._script_map)
-            ts_path = self._script_map.get(class_name)
-            print("convert ts_path--",ts_path)
-            if ts_path is None:
                 if VERBOSE:
                     print(f"    ⚠  Script '{class_name}.ts' not found in assets root")
                 return
 
         dst_scripts = self._out_folder / "assets" / "Scripts"
-        dst_scripts.mkdir(parents=True,exist_ok=True)
-        dst_scripts.mkdir(parents=True,exist_ok=True)
+        dst_scripts.mkdir(parents=True, exist_ok=True)
         dst_js   = dst_scripts / (output_name + ".js")
         dst_meta = dst_scripts / (output_name + ".js.meta")
-        # Find source meta: Try Script.ts.meta then Script.meta
+
+        # ── Priority 1: check pre-converted dirs by ts stem name ──────────────
+        if PRE_CONVERTED_DIRS:
+            pre_reg = get_pre_converted()
+            result  = pre_reg.find(output_name)  # lookup by stem
+            print(f"    [pre-conv] {ts_path.stem}:")
+            
+            if result:
+                src_ts, new_uuid = result
+                # Copy .ts file to output Scripts folder
+                dst_ts   = dst_scripts / src_ts.name
+                dst_ts_meta = dst_scripts / (src_ts.name + ".meta")
+                print(f"    [pre-conv] {ts_path.stem}: {src_ts} {new_uuid}")
+                
+                if not dst_ts.exists():
+                    shutil.copy2(src_ts, dst_ts)
+                # Copy .ts.meta as-is — it has the correct CC2 UUID
+                src_ts_meta = src_ts.parent / (src_ts.name + ".meta")
+                if src_ts_meta.exists() and not dst_ts_meta.exists():
+                    shutil.copy2(src_ts_meta, dst_ts_meta)
+                print(f"    ✓ script  {src_ts.name}  [pre-converted, uuid={new_uuid[:8]}…]")
+                self.n_scripts += 1
+                return
+
+        # ── Priority 2: convert from .ts source ───────────────────────────────
         src_meta_path = ts_path.parent / (ts_path.name + ".meta")
         if not src_meta_path.exists():
             src_meta_path = ts_path.with_suffix(".meta")
         if not src_meta_path.exists():
             src_meta_path = None
-        # Convert script file
+
         if not dst_js.exists():
             convert_script_file(ts_path, dst_js)
-        # Write CC2-format meta (NOT a copy of CC3 meta — format is different)
         if not dst_meta.exists():
             uuid = ""
             if src_meta_path:
@@ -1196,20 +1436,16 @@ class Pipeline:
                     uuid = json.loads(src_meta_path.read_text("utf-8")).get("uuid", "")
                 except Exception:
                     pass
-            cc2_meta = {
-                "ver": "1.1.0",
-                "uuid": uuid,
-                "importer": "typescript",
-                "isPlugin": False,
-                "loadPluginInWeb": True,
-                "loadPluginInNative": True,
-                "loadPluginInEditor": False,
+            dst_meta.write_text(json.dumps({
+                "ver": "1.1.0", "uuid": uuid, "importer": "typescript",
+                "isPlugin": False, "loadPluginInWeb": True,
+                "loadPluginInNative": True, "loadPluginInEditor": False,
                 "subMetas": {}
-            }
-            dst_meta.write_text(json.dumps(cc2_meta, indent=2, ensure_ascii=False), "utf-8")
-            if VERBOSE: print(f"    [meta]  → Scripts/{output_name}.js.meta  (uuid={uuid[:8]}…)")
+            }, indent=2, ensure_ascii=False), "utf-8")
         print(f"    ✓ script  {ts_path.name}  →  Scripts/{output_name}.js + .meta")
-        self.n_scripts+=1
+        self.n_scripts += 1
+
+
     # ── summary ───────────────────────────────────────────────────────────────
     def _print_summary(self):
         n_assets = len(self.copier.uuid_map) if self.copier else 0
