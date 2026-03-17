@@ -987,10 +987,14 @@ class Pipeline:
     def __init__(self, src_root: Path, out_root: Path, assets_root: Path):
         self.src     = src_root
         self.out     = out_root
-        # When output is a single file, place assets/ next to it, not inside it
-        assets_out_root = out_root.parent if (src_root.is_file() and out_root.suffix) else out_root
+        # For single-file output: place assets in <prefab_stem>/ next to the output file
+        # For folder output: place assets inside the output folder
+        if src_root.is_file() and out_root.suffix:
+            self._out_folder = out_root.parent / out_root.stem
+        else:
+            self._out_folder = out_root
         self.reg     = AssetRegistry(assets_root) if DO_ASSETS else None
-        self.copier  = AssetCopier(self.reg, assets_out_root) if DO_ASSETS and self.reg else None
+        self.copier  = AssetCopier(self.reg, self._out_folder) if DO_ASSETS and self.reg else None
 
         # stats
         self.n_prefabs  = 0
@@ -998,14 +1002,33 @@ class Pipeline:
         self.n_scripts  = 0
         self.n_errors   = 0
 
-        # script source lookup: class_short_name → Path(.ts)
-        self._script_map: dict[str, Path] = {}
+        # script source lookup: class_short_name → Path(.ts)  AND  uuid → Path(.ts)
+        self._script_map: dict[str, Path] = {}   # stem → path
+        self._uuid_script_map: dict[str, Path] = {}  # uuid → path
         if DO_SCRIPTS and assets_root and assets_root.exists():
             for ts in assets_root.rglob("*.ts"):
                 self._script_map[ts.stem] = ts
+                # read sibling .meta to get uuid — try both Script.ts.meta and Script.meta
+                for meta_path in [ts.parent / (ts.name + ".meta"), ts.with_suffix(".meta")]:
+                    if meta_path.exists():
+                        try:
+                            m = json.loads(meta_path.read_text("utf-8"))
+                            uid = m.get("uuid")
+                            if uid:
+                                self._uuid_script_map[uid] = ts
+                                # also index sub-metas if any
+                                for sub in m.get("subMetas", {}).values():
+                                    sub_uid = sub.get("uuid")
+                                    if sub_uid:
+                                        self._uuid_script_map[sub_uid] = ts
+                        except Exception:
+                            pass
+                        break
 
     # ── entry ─────────────────────────────────────────────────────────────────
     def run(self):
+        if DO_SCRIPTS:
+            print(f"Script index : {len(self._script_map)} by name, {len(self._uuid_script_map)} by UUID")
         if self.src.is_file():
             self._process_prefab(self.src, self.out if self.out.suffix else self.out/self.src.name)
         elif self.src.is_dir():
@@ -1065,18 +1088,34 @@ class Pipeline:
                 self._convert_script(short, dst.parent)
 
     # ── script conversion ─────────────────────────────────────────────────────
+    _UUID_RE = re.compile(r'^[0-9a-fA-F+/]{20,}$')  # CC3 UUIDs are base64-ish, 20+ chars
+
     def _convert_script(self, class_name: str, prefab_out_dir: Path):
-        ts_path = self._script_map.get(class_name)
-        if ts_path is None:
-            print(f"    ⚠  Script '{class_name}.ts' not found in assets root")
-            return
-        dst_scripts = self.out / "assets" / "Scripts"
+        # If class_name looks like a UUID, resolve it via the uuid→ts map first
+        ts_path = None
+        output_name = class_name  # default js output filename
+
+        if self._UUID_RE.match(class_name):
+            ts_path = self._uuid_script_map.get(class_name)
+            if ts_path:
+                output_name = ts_path.stem  # use the actual filename, not the UUID
+            else:
+                if VERBOSE:
+                    print(f"    ⚠  Script UUID '{class_name}' not found in assets root")
+                return
+        else:
+            ts_path = self._script_map.get(class_name)
+            if ts_path is None:
+                print(f"    ⚠  Script '{class_name}.ts' not found in assets root")
+                return
+
+        dst_scripts = self._out_folder / "assets" / "Scripts"
         dst_scripts.mkdir(parents=True,exist_ok=True)
-        dst_js = dst_scripts / (class_name+".js")
+        dst_js = dst_scripts / (output_name + ".js")
         if dst_js.exists():
             return   # already converted (shared by multiple prefabs)
         convert_script_file(ts_path, dst_js)
-        print(f"    ✓ script  {class_name}.ts  →  Scripts/{class_name}.js")
+        print(f"    ✓ script  {ts_path.name}  →  Scripts/{output_name}.js")
         self.n_scripts+=1
 
     # ── summary ───────────────────────────────────────────────────────────────
