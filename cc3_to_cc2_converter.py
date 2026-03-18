@@ -55,7 +55,7 @@ CC2_INTERNAL_DIRS: list[str] = [
 # When a prefab references a script by name, these folders are checked FIRST.
 # If found: the existing .ts + .meta is copied, UUID rewritten in prefab.
 PRE_CONVERTED_DIRS: list[str] = [
-    "/Users/nhitieu/NewProject_2/assets/bundles"
+    "/Users/nhitieu/Documents/Projects/WPTGNewClient1/wptg-client/assets"
     # "/Users/nhitieu/Documents/Projects/WPTGNewClient1/wptg-client/assets"
     # "/Users/nhitieu/NewProject_2/assets/bundles"
     # Add your pre-converted script folder paths here, e.g.:
@@ -68,6 +68,7 @@ PRE_CONVERTED_DIRS: list[str] = [
 # Lookup in PRE_CONVERTED_DIRS will use the CC2 name.
 # Format: ("CC3_stem", "CC2_stem")
 NAME_CONVENTIONS: list[tuple[str, str]] = [
+    ("SeatLandscape","Seat")
     # ("BottomMenuHandler",         "BottomMenuHandlerPortrait"),
     # ("SomeOldName",               "SomeNewName"),
 ]
@@ -76,6 +77,7 @@ NAME_CONVENTIONS: list[tuple[str, str]] = [
 # When looking up a script in PRE_CONVERTED_DIRS, also try appending these
 # suffixes to the stem. First match wins.
 # Example: "TopBar" → tries "TopBarPortrait", "TopBar_Portrait", "TopBarLandscape" …
+
 EXTENSION_SUFFIXES: list[str] = [
     "Portrait", "_Portrait",
     "Landscape", "_Landscape",
@@ -1462,28 +1464,29 @@ def conv_skeleton(c,nr):
             "timeScale":_f(c,"timeScale","_timeScale",default=1.0),
             "debugBones":_b(c,"debugBones"),"debugSlots":_b(c,"debugSlots"),"_id":""}
 
-def conv_custom_script(c, nr, id_map=None):
+def conv_custom_script(c, nr, id_map=None, comp_map=None):
     """
     Any component whose __type__ contains a dot-less name or a project namespace
     (i.e. not a cc.* / sp.* builtin) is treated as a custom script component.
     We preserve all serialised properties and re-type it as the same name so
     CC2 can load the converted .js file.
-    id_map: CC3 index → CC2 index, used to remap __id__ node references.
+    comp_map: CC3 comp idx → CC2 comp idx (cc.Sprite, cc.Label etc)
+    id_map:   CC3 node idx → CC2 node idx (cc.Node props)
     """
     t = c.get("__type__","")
 
     def _remap(obj):
-        """Recursively remap CC3 __id__ refs to CC2 indices using id_map."""
-        if id_map is None:
-            return obj
+        """Remap CC3 __id__ refs: comp_map (components) then id_map (nodes)."""
         if isinstance(obj, dict):
             if "__id__" in obj and len(obj) == 1:
                 cc3_id = obj["__id__"]
-                cc2_id = id_map.get(cc3_id)
-                if cc2_id is not None:
-                    return {"__id__": cc2_id}
-                else:
-                    return None  # node not in map (filtered out)
+                if comp_map is not None:
+                    v = comp_map.get(cc3_id)
+                    if v is not None: return {"__id__": v}
+                if id_map is not None:
+                    v = id_map.get(cc3_id)
+                    if v is not None: return {"__id__": v}
+                return None
             return {k: _remap(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [_remap(v) for v in obj]
@@ -1493,7 +1496,7 @@ def conv_custom_script(c, nr, id_map=None):
     result = {"__type__": t, "_name":"","_objFlags":0, "node": nr,
               "_enabled": _b(c,"_enabled",default=True)}
     # copy all other serialised fields, remapping __id__ refs
-    skip = {"__type__","_name","_objFlags","node","_enabled","_id","__editorExtras__","__prefab__"}
+    skip = {"__type__","_name","_objFlags","node","_enabled","_id","__editorExtras__","__prefab__","__prefab"}
     for k,v in c.items():
         if k not in skip:
             result[k] = _remap(v)
@@ -1569,7 +1572,8 @@ class PrefabConverter:
     def __init__(self, cc3, uuid_script_map=None):
         self.cc3 = cc3
         self.cc2 = []
-        self._map = {}
+        self._map = {}           # CC3 node index → CC2 node index
+        self._comp_map = {}      # CC3 component index → CC2 component index
         self._uuid_script_map = uuid_script_map or {}
 
     def _allocate(self):
@@ -1748,7 +1752,7 @@ class PrefabConverter:
             else:
                 # Pass id_map to custom script converter for __id__ remapping
                 if fn is conv_custom_script:
-                    cc2c=fn(comp, ref(idx), id_map=self._map)
+                    cc2c=fn(comp, ref(idx), id_map=self._map, comp_map=self._comp_map)
                 else:
                     cc2c=fn(comp,ref(idx))
                 if cc2c is None: continue
@@ -1773,11 +1777,26 @@ class PrefabConverter:
         self.cc2[idx]=build_node(name,x,y,z,sx,sy,rz,w,h,ax,ay,active,opacity,r,g,b,a,
                                   parent,children,comp_refs,prefab_info)
 
+    def _build_comp_map(self):
+        """Pre-compute CC3 component index → CC2 component index."""
+        cc2_idx = len(self.cc2)
+        for ci in sorted(self._map):
+            o = self.cc3[ci]
+            if not (isinstance(o, dict) and o.get("__type__") == "cc.Node"):
+                continue
+            for ci2, comp in get_all_components(self.cc3, o):
+                t = comp.get("__type__", "")
+                fn = find_converter(t)
+                if fn is None or fn in ("SILENT_SKIP", "UIOPACITY", "SKIP"):
+                    continue
+                self._comp_map[ci2] = cc2_idx
+                cc2_idx += 1
+
     def convert(self):
-        self._allocate(); self._prefab_header(); self._convert_nodes()
+        self._allocate(); self._prefab_header()
+        self._build_comp_map()
+        self._convert_nodes()
         return [o for o in self.cc2 if o is not None]
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline  (folder scan + asset copy + script convert)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2013,8 +2032,8 @@ class Pipeline:
                 return
 
         dst_scripts = self._out_folder / "cloned_from_3x" / "Scripts"
-        dst_js   = dst_scripts / (output_name + ".js")
-        dst_meta = dst_scripts / (output_name + ".js.meta")
+        dst_ts   = dst_scripts / (output_name + ".ts")
+        dst_meta = dst_scripts / (output_name + ".ts.meta")
 
         # ── Priority 1: check pre-converted dirs by ts stem name ──────────────
         if PRE_CONVERTED_DIRS:
@@ -2022,13 +2041,12 @@ class Pipeline:
             result  = pre_reg.find(output_name)  # lookup by stem
             if result:
                 src_ts, new_uuid, matched_stem = result
-                # Script already exists in CC2 project — do NOT copy to output
                 conv_note = f" → {matched_stem}" if matched_stem != output_name else ""
                 print(f"    ✓ script  {output_name}{conv_note}  [pre-converted, skipping copy]")
                 self.n_scripts += 1
                 return
 
-        # ── Priority 2: convert from .ts source (not in pre-converted dirs) ──────
+        # ── Priority 2: copy .ts source (CC2 compiles .ts natively) ──────────
         dst_scripts.mkdir(parents=True, exist_ok=True)
         src_meta_path = ts_path.parent / (ts_path.name + ".meta")
         if not src_meta_path.exists():
@@ -2036,8 +2054,8 @@ class Pipeline:
         if not src_meta_path.exists():
             src_meta_path = None
 
-        if not dst_js.exists():
-            convert_script_file(ts_path, dst_js)
+        if not dst_ts.exists():
+            shutil.copy2(ts_path, dst_ts)
         if not dst_meta.exists():
             uuid = ""
             if src_meta_path:
@@ -2051,7 +2069,7 @@ class Pipeline:
                 "loadPluginInNative": True, "loadPluginInEditor": False,
                 "subMetas": {}
             }, indent=2, ensure_ascii=False), "utf-8")
-        print(f"    ✓ script  {ts_path.name}  →  Scripts/{output_name}.js + .meta")
+        print(f"    ✓ script  {ts_path.name}  →  Scripts/{output_name}.ts + .meta")
         self.n_scripts += 1
 
 
